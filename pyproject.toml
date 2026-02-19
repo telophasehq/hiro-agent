@@ -1,0 +1,29 @@
+[project]
+name = "hiro-agent"
+version = "0.1.0"
+description = "AI security review agent for code, plans, and infrastructure"
+requires-python = ">=3.11"
+license = "MIT"
+readme = "README.md"
+dependencies = [
+    "claude-agent-sdk>=0.1.37",
+    "structlog",
+    "click>=8.0",
+]
+
+[project.scripts]
+hiro = "hiro_agent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hiro_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
