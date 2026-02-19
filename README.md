@@ -5,6 +5,10 @@ AI security review agent for code, plans, and infrastructure. Integrates with Cl
 ## Install
 
 ```bash
+# Recommended (isolated environment, works on macOS/Linux)
+pipx install hiro-agent
+
+# Or with pip in a virtual environment
 pip install hiro-agent
 ```
 

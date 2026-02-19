@@ -5,7 +5,9 @@ session and rejecting the spawn. This is intentional — the review agent is
 a separate subprocess, not a nested invocation of the caller's session.
 """
 
+import json
 import os
+from pathlib import Path
 
 import structlog
 from claude_agent_sdk import (
@@ -23,13 +25,27 @@ HIRO_MCP_URL = "https://api.hiro.is/mcp/architect"
 HIRO_BACKEND_URL = "https://api.hiro.is"
 
 
+def _get_api_key() -> str:
+    """Resolve Hiro API key: env var first, then .hiro/config.json."""
+    key = os.environ.get("HIRO_API_KEY", "")
+    if key:
+        return key
+    config_file = Path(".hiro/config.json")
+    if config_file.exists():
+        try:
+            return json.loads(config_file.read_text()).get("api_key", "")
+        except Exception:
+            return ""
+    return ""
+
+
 def _get_mcp_config() -> dict[str, McpHttpServerConfig]:
     """Build MCP server config for connecting to Hiro.
 
-    Returns an empty dict when HIRO_API_KEY is not set (MCP context
+    Returns an empty dict when no API key is available (MCP context
     tools will be unavailable but the review still runs).
     """
-    key = os.environ.get("HIRO_API_KEY", "")
+    key = _get_api_key()
     if not key:
         return {}
     return {
@@ -43,12 +59,12 @@ def _get_mcp_config() -> dict[str, McpHttpServerConfig]:
 def _get_agent_env() -> dict[str, str]:
     """Build env vars for the agent subprocess.
 
-    When HIRO_API_KEY is set, route LLM calls through the Hiro backend
-    proxy to Bedrock (keeps source code within AWS infrastructure).
+    When a Hiro API key is available, route LLM calls through the Hiro
+    backend proxy to Bedrock (keeps source code within AWS infrastructure).
     Otherwise the agent uses the developer's ANTHROPIC_API_KEY directly.
     """
     env: dict[str, str] = {"CLAUDECODE": ""}
-    api_key = os.environ.get("HIRO_API_KEY", "")
+    api_key = _get_api_key()
     if api_key:
         env["ANTHROPIC_BASE_URL"] = f"{HIRO_BACKEND_URL}/api/llm-proxy"
         env["ANTHROPIC_API_KEY"] = api_key

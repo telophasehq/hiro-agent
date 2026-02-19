@@ -50,20 +50,25 @@ def _ensure_state_dir(project_root: Path) -> None:
 
 
 def _ensure_gitignore(project_root: Path) -> None:
-    """Add .hiro/.state/ to .gitignore if not already present."""
+    """Add .hiro/.state/ and .hiro/config.json to .gitignore."""
     gitignore = project_root / ".gitignore"
-    entry = ".hiro/.state/"
+    entries = [".hiro/.state/", ".hiro/config.json"]
 
     if gitignore.exists():
         content = gitignore.read_text()
-        if entry in content:
-            return
-        if not content.endswith("\n"):
-            content += "\n"
-        content += f"{entry}\n"
-        gitignore.write_text(content)
     else:
-        gitignore.write_text(f"{entry}\n")
+        content = ""
+
+    added = False
+    for entry in entries:
+        if entry not in content:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += f"{entry}\n"
+            added = True
+
+    if added:
+        gitignore.write_text(content)
 
 
 def _install_hooks(project_root: Path) -> None:
@@ -307,10 +312,61 @@ TOOL_SETUP_MAP = {
 }
 
 
+def _load_project_config(project_root: Path) -> dict:
+    config_file = project_root / ".hiro" / "config.json"
+    if not config_file.exists():
+        return {}
+    try:
+        return json.loads(config_file.read_text())
+    except Exception:
+        return {}
+
+
+def _save_project_config(project_root: Path, updates: dict) -> None:
+    config_file = project_root / ".hiro" / "config.json"
+    config = _load_project_config(project_root)
+    config.update(updates)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(json.dumps(config, indent=2) + "\n")
+    os.chmod(config_file, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+
+
+def _prompt_api_key(project_root: Path) -> None:
+    """Prompt user for API key and store in .hiro/config.json."""
+    existing_env = os.environ.get("HIRO_API_KEY", "")
+    if existing_env:
+        click.echo(f"API key: using HIRO_API_KEY environment variable.")
+        return
+
+    existing = _load_project_config(project_root).get("api_key", "")
+    if existing:
+        click.echo(f"API key: found in .hiro/config.json")
+        if not click.confirm("  Update it?", default=False):
+            return
+
+    api_key = click.prompt(
+        "Enter your Hiro API key (get one at https://app.hiro.is/settings/api-keys)",
+        hide_input=True,
+        default="",
+        show_default=False,
+    )
+
+    if not api_key:
+        click.echo("  Skipped. Set HIRO_API_KEY env var or re-run `hiro setup` later.")
+        return
+
+    _save_project_config(project_root, {"api_key": api_key})
+    click.echo(f"  Saved to .hiro/config.json")
+
+
 def run_setup(tool_filter: str | None = None) -> None:
     """Main setup entry point."""
     project_root = Path.cwd()
     click.echo(f"Setting up Hiro in {project_root}\n")
+
+    # Prompt for API key first
+    _prompt_api_key(project_root)
+    click.echo()
 
     # Always install hooks and state dir
     _install_hooks(project_root)

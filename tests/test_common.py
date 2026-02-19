@@ -1,6 +1,8 @@
 """Tests for hiro_agent._common — shared agent runner."""
 
+import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -9,9 +11,39 @@ from hiro_agent._common import (
     HIRO_BACKEND_URL,
     HIRO_MCP_URL,
     _get_agent_env,
+    _get_api_key,
     _get_mcp_config,
     run_review_agent,
 )
+
+
+class TestGetApiKey:
+    """Test _get_api_key() resolution order."""
+
+    def test_env_var_takes_precedence(self, tmp_path: Path):
+        """Env var should win over config file."""
+        config_file = tmp_path / ".hiro" / "config.json"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(json.dumps({"api_key": "from_config"}))
+        with patch.dict(os.environ, {"HIRO_API_KEY": "from_env"}):
+            assert _get_api_key() == "from_env"
+
+    def test_falls_back_to_config_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Should read from .hiro/config.json when env var is unset."""
+        config_file = tmp_path / ".hiro" / "config.json"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(json.dumps({"api_key": "from_config"}))
+        monkeypatch.chdir(tmp_path)
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("HIRO_API_KEY", None)
+            assert _get_api_key() == "from_config"
+
+    def test_returns_empty_when_nothing_configured(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Should return empty string when no key is available."""
+        monkeypatch.chdir(tmp_path)
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("HIRO_API_KEY", None)
+            assert _get_api_key() == ""
 
 
 class TestGetMcpConfig:
