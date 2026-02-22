@@ -1,28 +1,34 @@
 """Plan review agent — STRIDE threat modeling on design documents."""
 
 import asyncio
+import os
 import sys
 
 import structlog
 
-from hiro_agent._common import run_review_agent
+from hiro_agent._common import run_streaming_agent
 from hiro_agent.prompts import PLAN_REVIEW_SYSTEM_PROMPT
 
 logger = structlog.get_logger(__name__)
 
-MAX_TURNS = 10
+ALLOWED_TOOLS = ["Read", "Grep", "Glob"]
+MAX_TURNS = 15
 
 
 async def review_plan(
     plan: str,
     *,
+    cwd: str | None = None,
     context: str = "",
-) -> str:
+    verbose: bool = False,
+) -> None:
     """Run a STRIDE threat model review on an implementation plan.
 
     Args:
         plan: The plan text, architecture description, or design document.
+        cwd: Working directory (repo root).
         context: Additional context (e.g., "Public-facing payment API").
+        verbose: Print tool use details to stderr.
     """
     prompt_parts = ["Review this implementation plan for security concerns:\n"]
     if context:
@@ -33,15 +39,16 @@ async def review_plan(
 
     logger.info("review_plan_started", plan_len=len(plan))
 
-    result = await run_review_agent(
+    await run_streaming_agent(
         prompt=prompt,
         system_prompt=PLAN_REVIEW_SYSTEM_PROMPT,
-        allowed_tools=[],
+        cwd=cwd,
+        allowed_tools=ALLOWED_TOOLS,
         max_turns=MAX_TURNS,
+        verbose=verbose,
     )
 
-    logger.info("review_plan_completed", result_len=len(result))
-    return result
+    logger.info("review_plan_completed")
 
 
 def main() -> None:
@@ -51,8 +58,8 @@ def main() -> None:
         print("No input provided. Pipe a plan: cat plan.md | hiro review-plan")
         sys.exit(1)
 
-    result = asyncio.run(review_plan(plan))
-    print(result)
+    cwd = os.getcwd()
+    asyncio.run(review_plan(plan, cwd=cwd))
 
 
 if __name__ == "__main__":

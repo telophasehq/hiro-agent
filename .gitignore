@@ -5,3 +5,7 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.hiro/.state/
+.hiro/.scratchpad/
+.hiro/logs/
+.hiro/config.json

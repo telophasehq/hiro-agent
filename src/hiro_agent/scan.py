@@ -1,4 +1,4 @@
-"""Code review — multi-agent security audit of a diff."""
+"""Codebase security scan — three-phase audit with per-skill agents."""
 
 import asyncio
 import os
@@ -20,7 +20,7 @@ from hiro_agent._common import (
 )
 from hiro_agent.prompts import (
     CONTEXT_PREAMBLE,
-    DIFF_RECON_SYSTEM_PROMPT,
+    RECON_SYSTEM_PROMPT,
     REPORT_SYSTEM_PROMPT,
     SKILL_AGENT_SYSTEM_PROMPT,
 )
@@ -31,32 +31,30 @@ logger = structlog.get_logger(__name__)
 RECON_TOOLS = ["Read", "Grep", "Glob", "TodoWrite", "TodoRead"]
 
 
-async def review_code(
-    diff: str,
+async def scan(
     *,
     cwd: str | None = None,
-    context: str = "",
+    focus: str = "",
     verbose: bool = False,
 ) -> None:
-    """Run a multi-agent security review of a diff.
+    """Run a comprehensive security scan of the codebase.
 
-    Four phases (same architecture as scan, scoped to a diff):
-      1. Reconnaissance — understand the code around the diff
-      2. Compact — compress recon into a concise brief
+    Four phases:
+      1. Reconnaissance — explore the codebase, map structure
+      2. Compact — compress recon into a concise brief for skill agents
       3. Skill agents — parallel investigations, one per skill
       4. Report — synthesize findings into a structured report
 
     Args:
-        diff: Git diff output to review.
         cwd: Working directory (repo root).
-        context: Additional context about the code.
+        focus: Optional focus area (e.g., "auth", "api endpoints", "crypto").
         verbose: Print tool use details to stderr.
     """
     repo_name = os.path.basename(cwd) if cwd else "this codebase"
     is_tty = sys.stderr.isatty()
-    review_start = _time.monotonic()
+    scan_start = _time.monotonic()
 
-    logger.info("review_code_started", cwd=cwd, diff_len=len(diff))
+    logger.info("scan_started", cwd=cwd, focus=focus or "general")
 
     # Shared MCP setup — called once, reused by all agents
     mcp_setup = await prepare_mcp(is_tty=is_tty)
@@ -65,17 +63,16 @@ async def review_code(
     scratchpad_dir = Path(cwd or ".") / ".hiro" / ".scratchpad"
 
     try:
-        # -- Phase 1: Reconnaissance ------------------------------------------
+        # -- Phase 1: Reconnaissance -----------------------------------------
         if display:
             display.start_recon()
 
         recon_prompt_parts = [
-            f"Review the following diff from **{repo_name}** ({cwd or '.'}).",
-            "Explore the surrounding code to understand the security context.",
-            f"\n## Diff\n\n```diff\n{diff}\n```",
+            f"Explore and map the codebase at **{repo_name}** ({cwd or '.'}).",
+            "Produce a structured reconnaissance summary.",
         ]
-        if context:
-            recon_prompt_parts.append(f"\nAdditional context: {context}")
+        if focus:
+            recon_prompt_parts.append(f"\nPay special attention to: {focus}")
 
         def _on_recon_tool(agent_name: str, tool_name: str, summary: str, is_subagent: bool) -> None:
             if display:
@@ -85,11 +82,15 @@ async def review_code(
             if display:
                 display.recon_text(text)
 
+        def _on_recon_todos(agent_name: str, todos: list[dict]) -> None:
+            if display:
+                display.recon_todos(todos)
+
         t0 = _time.monotonic()
         recon, _ = await _run_tracked_agent(
             name="recon",
             prompt="\n".join(recon_prompt_parts),
-            system_prompt=DIFF_RECON_SYSTEM_PROMPT,
+            system_prompt=RECON_SYSTEM_PROMPT,
             cwd=cwd,
             allowed_tools=RECON_TOOLS,
             mcp_setup=mcp_setup,
@@ -97,6 +98,7 @@ async def review_code(
             model="opus",
             on_tool=_on_recon_tool,
             on_text=_on_recon_text,
+            on_todos=_on_recon_todos,
         )
         logger.info("phase_completed", phase="recon", duration_s=round(_time.monotonic() - t0, 1))
 
@@ -104,7 +106,7 @@ async def review_code(
         if display:
             display.show_recon_summary(recon)
 
-        # -- Phase 1b: Compact recon summary -----------------------------------
+        # -- Phase 1b: Compact recon summary for downstream agents ------------
         t0 = _time.monotonic()
         compact_mcp = McpSetup(mcp_config={})
         recon_brief, _ = await _run_tracked_agent(
@@ -127,7 +129,7 @@ async def review_code(
         )
         logger.info("phase_completed", phase="compact", duration_s=round(_time.monotonic() - t0, 1))
 
-        # -- Phase 2: Skill agents (parallel, multi-wave) ----------------------
+        # -- Phase 2: Skill agents (parallel, multi-wave) --------------------
         if display:
             display.start_investigations()
 
@@ -149,13 +151,11 @@ async def review_code(
             )
 
             skill_prompt_parts = [
-                f"## Diff Under Review\n\n```diff\n{diff}\n```",
-                f"\n## Reconnaissance Summary\n\n{recon_brief}",
-                f"\nInvestigate **{name}** security issues in this diff and the surrounding code.",
-                "Focus on the changes in the diff, but trace data flow into and out of the changed code.",
+                f"## Reconnaissance Summary\n\n{recon_brief}",
+                f"\nInvestigate **{name}** security issues in this codebase.",
             ]
-            if context:
-                skill_prompt_parts.append(f"\nAdditional context: {context}")
+            if focus:
+                skill_prompt_parts.append(f"\nFocus especially on: {focus}")
 
             def _on_tool(agent_name: str, tool_name: str, summary: str, is_subagent: bool) -> None:
                 if display:
@@ -179,6 +179,7 @@ async def review_code(
             if display:
                 display.agent_completed(name)
 
+            # Tag with investigation status so the report can flag incomplete runs
             if tool_call_count < 3:
                 status = f"INCOMPLETE — only {tool_call_count} tool calls"
             else:
@@ -216,17 +217,16 @@ async def review_code(
             failed=len(raw_results) - len(findings),
         )
 
-        # -- Phase 3: Report (streaming) --------------------------------------
+        # -- Phase 3: Report (streaming) -------------------------------------
         if display:
             display.start_report()
 
         t0 = _time.monotonic()
         combined = "\n\n".join(f"## {name}\n\n{text}" for name, text in findings)
         report_prompt = (
-            f"## Diff Under Review\n\n```diff\n{diff}\n```\n\n"
             f"## Reconnaissance Summary\n\n{recon}\n\n"
             f"## Investigation Findings\n\n{combined}\n\n"
-            "Synthesize the above into a final security report for this diff."
+            "Synthesize the above into a final security report."
         )
 
         await _run_report_stream(
@@ -242,8 +242,8 @@ async def review_code(
             display.finish()
 
         logger.info(
-            "review_code_completed",
-            total_s=round(_time.monotonic() - review_start, 1),
+            "scan_completed",
+            total_s=round(_time.monotonic() - scan_start, 1),
         )
 
     finally:
@@ -251,14 +251,9 @@ async def review_code(
 
 
 def main() -> None:
-    """CLI entry point: reads diff from stdin."""
-    diff = sys.stdin.read()
-    if not diff.strip():
-        print("No input provided. Pipe a diff: git diff | hiro review-code")
-        sys.exit(1)
-
+    """CLI entry point."""
     cwd = os.getcwd()
-    asyncio.run(review_code(diff, cwd=cwd))
+    asyncio.run(scan(cwd=cwd))
 
 
 if __name__ == "__main__":

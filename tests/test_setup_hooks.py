@@ -65,7 +65,9 @@ class TestEnsureGitignore:
         _ensure_gitignore(tmp_path)
         gitignore = tmp_path / ".gitignore"
         assert gitignore.exists()
-        assert ".hiro/.state/" in gitignore.read_text()
+        content = gitignore.read_text()
+        assert ".hiro/.state/" in content
+        assert ".hiro/config.json" in content
 
     def test_appends_to_existing_gitignore(self, tmp_path: Path):
         gitignore = tmp_path / ".gitignore"
@@ -74,12 +76,14 @@ class TestEnsureGitignore:
         content = gitignore.read_text()
         assert "node_modules/" in content
         assert ".hiro/.state/" in content
+        assert ".hiro/config.json" in content
 
     def test_idempotent(self, tmp_path: Path):
         _ensure_gitignore(tmp_path)
         _ensure_gitignore(tmp_path)
         content = (tmp_path / ".gitignore").read_text()
         assert content.count(".hiro/.state/") == 1
+        assert content.count(".hiro/config.json") == 1
 
 
 class TestDetectTools:

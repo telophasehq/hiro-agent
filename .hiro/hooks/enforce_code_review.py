@@ -134,8 +134,9 @@ def main() -> int:
                     file_list += f" and {len(files) - 5} more"
                 _deny(
                     f"Commit blocked: {len(files)} file(s) modified since last "
-                    f"security review ({file_list}).\n"
-                    "Run: git diff --cached | hiro review-code"
+                    f"security review ({file_list}). Run "
+                    "`git diff | hiro review-code` "
+                    "before committing."
                 )
                 return 0
 

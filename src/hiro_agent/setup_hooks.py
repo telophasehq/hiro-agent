@@ -122,7 +122,7 @@ def _setup_claude_code(project_root: Path) -> None:
         ],
         "PostToolUse": [
             {
-                "matcher": "Bash|mcp__hiro__review_plan",
+                "matcher": "Bash",
                 "hooks": [
                     {
                         "type": "command",
@@ -132,7 +132,7 @@ def _setup_claude_code(project_root: Path) -> None:
                 ],
             },
             {
-                "matcher": "Edit|Write|Bash|mcp__hiro__review_code",
+                "matcher": "Edit|Write|Bash",
                 "hooks": [
                     {
                         "type": "command",
@@ -359,16 +359,8 @@ def _prompt_api_key(project_root: Path) -> None:
     click.echo(f"  Saved to .hiro/config.json")
 
 
-def run_setup(tool_filter: str | None = None) -> None:
-    """Main setup entry point."""
-    project_root = Path.cwd()
-    click.echo(f"Setting up Hiro in {project_root}\n")
-
-    # Prompt for API key first
-    _prompt_api_key(project_root)
-    click.echo()
-
-    # Always install hooks and state dir
+def _run_hook_update(project_root: Path, tool_filter: str | None = None) -> None:
+    """Shared logic: install/update hooks and tool configs."""
     _install_hooks(project_root)
     _ensure_state_dir(project_root)
     _ensure_gitignore(project_root)
@@ -394,7 +386,29 @@ def run_setup(tool_filter: str | None = None) -> None:
     if "codex" not in tools:  # codex setup already installs it
         _setup_git_precommit(project_root)
 
+
+def run_setup(tool_filter: str | None = None) -> None:
+    """Main setup entry point — first-time installation."""
+    project_root = Path.cwd()
+    click.echo(f"Setting up Hiro in {project_root}\n")
+
+    # Prompt for API key first
+    _prompt_api_key(project_root)
+    click.echo()
+
+    _run_hook_update(project_root, tool_filter)
+
     click.echo("\nDone! Hiro security review hooks are active.")
+
+
+def run_upgrade(tool_filter: str | None = None) -> None:
+    """Upgrade hooks and tool configs without re-prompting for API key."""
+    project_root = Path.cwd()
+    click.echo(f"Upgrading Hiro hooks in {project_root}\n")
+
+    _run_hook_update(project_root, tool_filter)
+
+    click.echo("\nDone! Hooks and configs updated to latest version.")
 
 
 def run_verify() -> None:
