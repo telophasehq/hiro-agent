@@ -77,13 +77,17 @@ def _is_git_commit(command: str) -> bool:
 
 
 def _is_review_command(tool_name: str, tool_input: dict[str, Any]) -> bool:
-    """Check if this is a code review action (MCP tool or CLI command)."""
-    if tool_name == "mcp__hiro__review_code":
+    """Check if this is a hiro review action (MCP tool or CLI command)."""
+    if tool_name in ("mcp__hiro__review_code", "mcp__hiro__review_plan"):
         return True
     if tool_name == "Bash":
         cmd = tool_input.get("command", "")
-        # Match both old (hiro_review.review_code) and new (hiro review-code) forms
-        if "hiro_review.review_code" in cmd or "hiro review-code" in cmd:
+        if any(kw in cmd for kw in (
+            "hiro_review.review_code",
+            "hiro review-code",
+            "hiro_review.review_plan",
+            "hiro review-plan",
+        )):
             return True
     return False
 
@@ -122,15 +126,34 @@ def main() -> int:
         _allow()
         return 0
 
-    # --- PreToolUse: force hiro commands to write to file ---
+    # --- PreToolUse: enforce correct hiro invocation ---
     if event == "PreToolUse" and _is_review_command(tool_name, tool_input):
+        cmd = tool_input.get("command", "")
         if tool_input.get("run_in_background"):
             _deny(
                 "Hiro commands must not run in the background. "
-                "Re-run the same command with --output .hiro/.state/code-review.md "
-                "in the foreground, then use the Read tool on "
-                ".hiro/.state/code-review.md to read the report."
+                "Re-run the same command in the foreground with --output, then "
+                "use the Read tool on the output file to read the report."
             )
+            return 0
+        if "|" in cmd:
+            is_plan = "review-plan" in cmd or "review_plan" in cmd
+            if is_plan:
+                _deny(
+                    "Do not pipe into hiro review-plan. Use the --file flag instead:\n"
+                    "  hiro review-plan --file /path/to/plan.md "
+                    "--output .hiro/.state/plan-review.md\n"
+                    "Then use the Read tool on .hiro/.state/plan-review.md "
+                    "to read the report."
+                )
+            else:
+                _deny(
+                    "Do not pipe into hiro review-code. Use positional args instead:\n"
+                    "  hiro review-code --output .hiro/.state/code-review.md\n"
+                    "(It reads the git diff automatically.)\n"
+                    "Then use the Read tool on .hiro/.state/code-review.md "
+                    "to read the report."
+                )
             return 0
 
     # --- PreToolUse: block git commit if review is pending ---
