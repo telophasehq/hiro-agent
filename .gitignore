@@ -1,3 +1,4 @@
+.DS_Store
 __pycache__/
 *.pyc
 .venv/
@@ -7,5 +8,6 @@ build/
 .pytest_cache/
 .hiro/.state/
 .hiro/.scratchpad/
+.hiro/.scan_index.json
 .hiro/logs/
 .hiro/config.json

@@ -1,12 +1,14 @@
-name: Publish to PyPI
+name: CI
 
 on:
+  pull_request:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 jobs:
-  test-core:
+  core-review-gate:
+    name: Core Review Gate (blocking)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,7 +16,8 @@ jobs:
       - run: uv venv && uv pip install -e ".[dev]"
       - run: .venv/bin/pytest -q tests/test_review_code.py tests/test_review_plan.py tests/test_cli.py tests/test_common.py
 
-  test-scan-experimental:
+  scan-experimental:
+    name: Scan Regression (non-blocking)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -22,16 +25,3 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - run: uv venv && uv pip install -e ".[dev]"
       - run: .venv/bin/pytest -q tests/test_scan.py
-
-  publish:
-    needs: test-core
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - run: uv venv && uv pip install build
-      - run: .venv/bin/python -m build
-      - uses: pypa/gh-action-pypi-publish@release/v1

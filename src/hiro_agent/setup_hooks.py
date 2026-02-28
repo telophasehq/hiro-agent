@@ -50,9 +50,15 @@ def _ensure_state_dir(project_root: Path) -> None:
 
 
 def _ensure_gitignore(project_root: Path) -> None:
-    """Add .hiro/.state/ and .hiro/config.json to .gitignore."""
+    """Add .hiro runtime artifacts to .gitignore."""
     gitignore = project_root / ".gitignore"
-    entries = [".hiro/.state/", ".hiro/config.json"]
+    entries = [
+        ".hiro/.state/",
+        ".hiro/.scratchpad/",
+        ".hiro/.scan_index.json",
+        ".hiro/logs/",
+        ".hiro/config.json",
+    ]
 
     if gitignore.exists():
         content = gitignore.read_text()
@@ -104,7 +110,7 @@ def _setup_claude_code(project_root: Path) -> None:
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "python3 .hiro/hooks/enforce_plan_review.py",
+                        "command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_plan_review.py\"",
                         "timeout": 10,
                     }
                 ],
@@ -114,7 +120,7 @@ def _setup_claude_code(project_root: Path) -> None:
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "python3 .hiro/hooks/enforce_code_review.py",
+                        "command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_code_review.py\"",
                         "timeout": 10,
                     }
                 ],
@@ -122,11 +128,11 @@ def _setup_claude_code(project_root: Path) -> None:
         ],
         "PostToolUse": [
             {
-                "matcher": "Bash",
+                "matcher": "Bash|mcp__hiro__review_plan",
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "python3 .hiro/hooks/enforce_plan_review.py",
+                        "command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_plan_review.py\"",
                         "timeout": 10,
                     }
                 ],
@@ -136,7 +142,7 @@ def _setup_claude_code(project_root: Path) -> None:
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "python3 .hiro/hooks/enforce_code_review.py",
+                        "command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_code_review.py\"",
                         "timeout": 10,
                     }
                 ],
@@ -161,13 +167,13 @@ def _setup_cursor(project_root: Path) -> None:
         "version": 1,
         "hooks": {
             "beforeShellExecution": [
-                {"command": "python3 .hiro/hooks/enforce_code_review.py"}
+                {"command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_code_review.py\""}
             ],
             "afterFileEdit": [
-                {"command": "python3 .hiro/hooks/enforce_code_review.py"}
+                {"command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_code_review.py\""}
             ],
             "stop": [
-                {"command": "python3 .hiro/hooks/enforce_plan_review.py"}
+                {"command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_plan_review.py\""}
             ],
         },
     }
@@ -199,7 +205,7 @@ def _setup_vscode(project_root: Path) -> None:
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "python3 .hiro/hooks/enforce_plan_review.py",
+                        "command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_plan_review.py\"",
                     }
                 ],
             },
@@ -208,7 +214,7 @@ def _setup_vscode(project_root: Path) -> None:
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "python3 .hiro/hooks/enforce_code_review.py",
+                        "command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_code_review.py\"",
                     }
                 ],
             },
@@ -219,7 +225,7 @@ def _setup_vscode(project_root: Path) -> None:
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "python3 .hiro/hooks/enforce_code_review.py",
+                        "command": "python3 \"$(git rev-parse --show-toplevel)/.hiro/hooks/enforce_code_review.py\"",
                     }
                 ],
             },
@@ -266,7 +272,7 @@ for state_file in state_dir.glob("code_review_*.json"):
     if state.get("needs_review"):
         files = state.get("modified_files", [])
         print(f"Commit blocked: {len(files)} file(s) modified since last security review.")
-        print("Run: git diff | hiro review-code")
+        print("Run: git diff --cached | hiro review-code --output .hiro/.state/code-review.md")
         sys.exit(1)
 
 sys.exit(0)

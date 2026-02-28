@@ -38,7 +38,7 @@ class TestChat:
 
         assert "Read" in captured["allowed_tools"]
         assert "Grep" in captured["allowed_tools"]
-        assert "Glob" in captured["allowed_tools"]
+        assert "Glob" not in captured["allowed_tools"]
         assert "Bash" not in captured["allowed_tools"]
 
     @pytest.mark.asyncio

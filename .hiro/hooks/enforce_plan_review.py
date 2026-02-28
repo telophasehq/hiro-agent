@@ -109,9 +109,14 @@ def main() -> int:
                 return 0
 
             _deny_pre_tool(
-                "Plan finalization blocked: run "
-                "`cat <plan_file> | hiro review-plan` "
-                "and incorporate findings before exiting plan mode."
+                "Plan finalization blocked — Hiro security review required.\n\n"
+                "Run this exact Bash command:\n"
+                "  hiro review-plan --file /path/to/plan.md --output .hiro/.state/plan-review.md\n\n"
+                "Replace /path/to/plan.md with the plan file you wrote. "
+                "Do NOT use cat or pipes. Do NOT run in background.\n"
+                "After the command exits (code 0), use the Read tool on "
+                ".hiro/.state/plan-review.md to read the report.\n\n"
+                "Then call ExitPlanMode again — it will be allowed."
             )
             return 0
 

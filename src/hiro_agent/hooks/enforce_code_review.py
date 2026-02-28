@@ -15,12 +15,27 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-STATE_DIR = Path(".hiro/.state")
+
+def _git_root() -> Path:
+    """Resolve the git repo root so paths work from any CWD."""
+    try:
+        root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return Path(root)
+    except Exception:
+        return Path(".")
+
+
+STATE_DIR = _git_root() / ".hiro" / ".state"
 
 
 def _state_path(session_id: str) -> Path:
@@ -135,7 +150,8 @@ def main() -> int:
                 _deny(
                     f"Commit blocked: {len(files)} file(s) modified since last "
                     f"security review ({file_list}).\n"
-                    "Run: git diff --cached | hiro review-code"
+                    "Run: git diff --cached | hiro review-code --output .hiro/.state/code-review.md\n"
+                    "Then use the Read tool on .hiro/.state/code-review.md to read the report."
                 )
                 return 0
 

@@ -1,6 +1,15 @@
 # hiro-agent
 
-AI security review agent for code, plans, and infrastructure. Integrates with Claude Code, Cursor, VSCode Copilot, and Codex CLI to enforce security reviews before commits and plan finalization.
+AI security review agent for code, plans, and infrastructure.
+
+## What this project does
+
+- Reviews code diffs for security issues
+- Reviews implementation plans with threat-modeling prompts
+- Reviews infrastructure configs for security misconfigurations
+- Scans repositories with multi-skill, wave-based security investigations (experimental)
+
+It integrates with Claude Code, Cursor, VSCode Copilot, and Codex CLI to enforce review workflows before commits and plan finalization.
 
 ## Install
 
@@ -26,6 +35,9 @@ cat plan.md | hiro review-plan
 
 # Review infrastructure configuration
 hiro review-infra main.tf
+
+# Experimental: full-repo scan
+hiro scan
 ```
 
 ## Commands
@@ -35,7 +47,10 @@ hiro review-infra main.tf
 | `hiro review-code` | Security review of code changes (stdin: git diff) |
 | `hiro review-plan` | STRIDE threat model review of a plan (stdin) |
 | `hiro review-infra` | IaC security review (file arg or stdin) |
+| `hiro scan` | Full-repo multi-skill security scan (experimental/beta) |
+| `hiro chat "<question>"` | Ask security questions about current repo |
 | `hiro setup` | Auto-detect and configure all AI coding tools |
+| `hiro upgrade` | Update installed hooks/configs to latest package behavior |
 | `hiro verify` | Verify hook integrity against installed version |
 
 ### Setup Options
@@ -57,6 +72,8 @@ export HIRO_API_KEY=hiro_ak_...     # Optional: Hiro platform context
 export ANTHROPIC_API_KEY=sk-ant-... # Required if HIRO_API_KEY not set
 ```
 
+More details: `docs/configuration.md`
+
 ## How It Works
 
 1. **`hiro setup`** installs hook scripts in `.hiro/hooks/` and configures your AI coding tool to call them
@@ -64,6 +81,25 @@ export ANTHROPIC_API_KEY=sk-ant-... # Required if HIRO_API_KEY not set
 3. Hooks track plan creation and block finalization until `hiro review-plan` has run
 4. Review agents use `claude-agent-sdk` to spawn a Claude instance that performs the security review
 5. When connected to Hiro (`HIRO_API_KEY`), reviews are enriched with your org's security policy, accepted risks, and architecture context
+
+## Stability
+
+- Primary/release-gated workflows: `review-code`, `review-plan`
+- Secondary workflow: `review-infra`
+- Experimental workflow: `scan`
+
+## Architecture and Methodology
+
+- Architecture: `docs/architecture.md`
+- Scan methodology: `docs/scan-methodology.md`
+- Troubleshooting: `docs/troubleshooting.md`
+- Development: `docs/development.md`
+
+## Contributing
+
+- Contribution guide: `CONTRIBUTING.md`
+- Code of conduct: `CODE_OF_CONDUCT.md`
+- Security reporting: `SECURITY.md`
 
 ## License
 

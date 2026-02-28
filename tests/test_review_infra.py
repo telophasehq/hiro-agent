@@ -85,7 +85,7 @@ class TestReviewInfrastructure:
         with patch("hiro_agent.review_infra.run_review_agent", side_effect=mock_run):
             await review_infrastructure("config content", filename="Dockerfile")
 
-        assert captured["allowed_tools"] == ["Read", "Glob"]
+        assert captured["allowed_tools"] == ["Read", "Grep"]
 
     @pytest.mark.asyncio
     async def test_max_turns(self):
@@ -116,4 +116,4 @@ class TestReviewInfrastructure:
 
         assert "CIS Benchmarks" in captured["system_prompt"]
         assert "Read" in captured["system_prompt"]
-        assert "Glob" in captured["system_prompt"]
+        assert "Grep" in captured["system_prompt"]

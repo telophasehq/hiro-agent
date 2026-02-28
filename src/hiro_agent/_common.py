@@ -6,10 +6,12 @@ a separate subprocess, not a nested invocation of the caller's session.
 """
 
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time as _time
@@ -28,6 +30,19 @@ from claude_agent_sdk import (
 from claude_agent_sdk._errors import MessageParseError
 from claude_agent_sdk.types import AgentDefinition, McpHttpServerConfig, ToolResultBlock
 
+from hiro_agent.scope_gating import (
+    IGNORED_DIRS,
+    build_seed_scope,
+    evaluate_expansion_requests,
+    format_expansion_feedback,
+    get_skill_gate_policy,
+    list_first_party_files,
+    normalize_tool_read_path,
+    parse_expand_requests,
+    render_scope_gate_block,
+    resolve_wave_modes,
+)
+
 logger = structlog.get_logger(__name__)
 
 # Hardcoded — not configurable to prevent SSRF. HTTPS enforced.
@@ -35,27 +50,37 @@ HIRO_MCP_URL = "https://api.hiro.is/mcp/architect/mcp"
 HIRO_BACKEND_URL = "https://api.hiro.is"
 
 _EXPLORE_AGENT = AgentDefinition(
-    description="Fast, read-only codebase explorer for file discovery and code search.",
+    description="Read-only code retriever. Returns raw code — never analyzes or evaluates.",
     prompt=(
-        "You are a fast codebase explorer. Search for files, read code, and return "
-        "findings concisely. Do not modify any files. Skip dependency directories "
-        "(node_modules, .venv, vendor, dist, build, .git, __pycache__).\n\n"
-        "## CRITICAL: File reading limits\n\n"
-        "NEVER read more than 500 lines at once (roughly 25,000 characters). "
-        "For any file, ALWAYS pass `limit: 500` to the Read tool. If you need "
-        "more of the file, make multiple reads with `offset` to page through it. "
-        "Reading a full large file in one call will crash your context window.\n\n"
+        "You are a code retriever. Your ONLY job is to fetch code and return it verbatim.\n\n"
+        "## Rules\n\n"
+        "1. Return RAW CODE with file paths and line numbers. Copy-paste exactly what you see.\n"
+        "2. NEVER analyze, interpret, or evaluate code. No opinions. No conclusions.\n"
+        "3. NEVER say things like 'this is a vulnerability' or 'this is insecure'.\n"
+        "4. NEVER fabricate content. If a file doesn't contain what was asked about, "
+        "say 'NOT FOUND: [pattern] not present in [file]'.\n"
+        "5. NEVER invent commit hashes, line numbers, or code that isn't there.\n"
+        "6. If Grep returns no matches, say 'NO MATCHES' — do not guess.\n\n"
+        "## Output format\n\n"
+        "For each file you read, return:\n"
+        "```\n"
+        "FILE: path/to/file.py (lines X-Y)\n"
+        "[exact code from the file]\n"
+        "```\n\n"
+        "For each Grep search, return:\n"
+        "```\n"
+        "GREP: pattern in glob\n"
+        "[exact matching lines with file:line prefixes, or NO MATCHES]\n"
+        "```\n\n"
+        "## File reading limits\n\n"
+        "NEVER read more than 500 lines at once. ALWAYS pass `limit: 500` to Read. "
+        "If you need more, make multiple reads with `offset`.\n\n"
         "## Prefer Grep over Read\n\n"
-        "Use Grep to find specific patterns, functions, or code constructs "
-        "BEFORE reading files. Only Read the specific sections you need. "
-        "Examples:\n"
-        "- To find auth middleware: Grep for `auth|middleware|protect` first\n"
-        "- To find SQL queries: Grep for `SELECT|INSERT|execute|query` first\n"
-        "- To find config: Grep for `SECRET|KEY|PASSWORD|config` first\n\n"
-        "Grep with targeted patterns, then Read only the relevant lines."
+        "Use Grep to find specific patterns BEFORE reading files. "
+        "Only Read the specific sections that matched."
     ),
-    tools=["Read", "Grep", "Glob"],
-    model="haiku",
+    tools=["Read", "Grep"],
+    model="sonnet",
 )
 
 SKILL_TOOLS = ["Task", "Write", "TodoWrite", "TodoRead"]
@@ -191,7 +216,8 @@ def _mcp_call_tool(api_key: str, tool_name: str, arguments: dict | None = None, 
             # Extract text content from JSON-RPC result
             result = msg.get("result", {})
             content = result.get("content", [])
-            texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+            texts = [c.get("text", "")
+                     for c in content if c.get("type") == "text"]
             if texts:
                 return "\n".join(texts)
         return None
@@ -211,6 +237,20 @@ async def _prefetch_mcp_context(api_key: str) -> tuple[str | None, str | None]:
     return org_ctx, sec_pol
 
 
+async def _prefetch_review_context(api_key: str, diff: str) -> str | None:
+    """Fetch infrastructure-aware review context for a diff via MCP.
+
+    Calls get_review_context on the backend which parses the diff for
+    infrastructure signals, queries memories, and makes live API calls
+    to connected integrations. Uses a 30s timeout to allow live queries.
+
+    Returns the context string or None on failure.
+    """
+    return await asyncio.to_thread(
+        _mcp_call_tool, api_key, "get_review_context", {"diff": diff}, timeout=30,
+    )
+
+
 @dataclass
 class McpSetup:
     """Result of MCP preflight + prefetch. Shared across agents."""
@@ -218,6 +258,7 @@ class McpSetup:
     mcp_tools: list[str] = field(default_factory=list)
     org_context: str | None = None
     security_policy: str | None = None
+    review_context: str | None = None
 
 
 async def prepare_mcp(*, is_tty: bool = True) -> McpSetup:
@@ -252,16 +293,26 @@ async def prepare_mcp(*, is_tty: bool = True) -> McpSetup:
     )
 
 
-def _inject_prefetched_context(system_prompt: str, org_context: str | None, security_policy: str | None) -> str:
+def _inject_prefetched_context(
+    system_prompt: str,
+    org_context: str | None,
+    security_policy: str | None,
+    review_context: str | None = None,
+) -> str:
     """Prepend pre-fetched MCP context sections to the system prompt.
 
-    Returns the prompt unchanged if both values are None.
+    Returns the prompt unchanged if all values are None.
     """
     sections: list[str] = []
     if org_context:
-        sections.append(f"## Organizational Context (pre-loaded)\n\n{org_context}")
+        sections.append(
+            f"## Organizational Context (pre-loaded)\n\n{org_context}")
     if security_policy:
-        sections.append(f"## Security Policy (pre-loaded)\n\n{security_policy}")
+        sections.append(
+            f"## Security Policy (pre-loaded)\n\n{security_policy}")
+    if review_context:
+        sections.append(
+            f"## Infrastructure Context (pre-loaded)\n\n{review_context}")
     if not sections:
         return system_prompt
     return "\n\n".join(sections) + "\n\n" + system_prompt
@@ -308,6 +359,62 @@ def _patch_message_parser() -> None:
 _patch_message_parser()
 
 
+def _install_cancel_scope_handler() -> None:
+    """Suppress anyio cancel-scope RuntimeError from SDK async-generator finalization.
+
+    When the SDK's ``process_query`` async generator is finalized (e.g. on
+    Ctrl-C or GC), anyio may try to exit a cancel scope from a different
+    asyncio task than the one that entered it.  The resulting RuntimeError
+    surfaces as "Task exception was never retrieved".  Installing a custom
+    event-loop exception handler silences this specific (harmless) error.
+    """
+    loop = asyncio.get_running_loop()
+    _orig_handler = loop.get_exception_handler()
+
+    def _handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        exc = context.get("exception")
+        if isinstance(exc, RuntimeError):
+            msg = str(exc)
+            if "cancel scope" in msg and "different task" in msg:
+                logger.debug("suppressed_cancel_scope_error", error=msg)
+                return
+        if _orig_handler is not None:
+            _orig_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_handler)
+
+
+async def _safe_close_query_stream(stream: object, *, context: str) -> None:
+    """Best-effort close for SDK query streams.
+
+    Explicit close avoids async-generator finalizer shutdown on a different task,
+    which can surface AnyIO cancel-scope RuntimeError on some SDK/runtime combos.
+    """
+    aclose = getattr(stream, "aclose", None)
+    if not callable(aclose):
+        return
+    try:
+        await aclose()
+    except RuntimeError as exc:
+        msg = str(exc)
+        if ("cancel scope" in msg and "different task" in msg) or "already running" in msg:
+            logger.warning(
+                "query_stream_close_suppressed",
+                context=context,
+                error=msg,
+            )
+            return
+        raise
+    except Exception as exc:
+        logger.warning(
+            "query_stream_close_suppressed",
+            context=context,
+            error=str(exc),
+        )
+
+
 async def run_review_agent(
     prompt: str,
     system_prompt: str,
@@ -322,7 +429,7 @@ async def run_review_agent(
 
     The agent connects to the Hiro MCP server for organizational context
     (memories, security policy, org profile) and optionally has filesystem
-    access via Read/Grep/Glob tools.
+    access via Read/Grep tools.
 
     Only read-only MCP tools are allowed — remember, set_org_context, and
     forget are explicitly excluded to prevent the review agent from
@@ -332,11 +439,14 @@ async def run_review_agent(
     pre-computed values. When None (default), call internal MCP setup
     for backward compatibility.
     """
+    _install_cancel_scope_handler()
+
     if mcp_setup is not None:
         mcp_config = mcp_setup.mcp_config
         mcp_tools = list(mcp_setup.mcp_tools)
         system_prompt = _inject_prefetched_context(
             system_prompt, mcp_setup.org_context, mcp_setup.security_policy,
+            mcp_setup.review_context,
         )
     else:
         mcp_config = _get_mcp_config()
@@ -349,30 +459,37 @@ async def run_review_agent(
                 mcp_config = {}
             else:
                 org_ctx, sec_pol = await _prefetch_mcp_context(api_key)
-                system_prompt = _inject_prefetched_context(system_prompt, org_ctx, sec_pol)
+                system_prompt = _inject_prefetched_context(
+                    system_prompt, org_ctx, sec_pol)
                 mcp_tools = ["mcp__hiro__recall"]
 
+    tools_list = (allowed_tools or []) + mcp_tools
     options = ClaudeAgentOptions(
         cwd=cwd,
-        allowed_tools=(allowed_tools or []) + mcp_tools,
+        tools=tools_list,
+        allowed_tools=tools_list,
         system_prompt=system_prompt,
         mcp_servers=mcp_config,
         permission_mode="acceptEdits",
         max_turns=max_turns,
         model=model,
-        agents={"explore": _EXPLORE_AGENT},
+        effort="high",
         env=_get_agent_env(),
-        stderr=lambda _: None,  # Suppress CLI subprocess output
+        stderr=lambda line: logger.debug("cli_stderr", agent="review", line=line.rstrip()),
     )
 
     summary = ""
-    async for message in query(prompt=prompt, options=options):
-        if message is None:
-            continue
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    summary = block.text
+    stream = query(prompt=prompt, options=options)
+    try:
+        async for message in stream:
+            if message is None:
+                continue
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        summary = block.text
+    finally:
+        await _safe_close_query_stream(stream, context="run_review_agent")
 
     return summary
 
@@ -409,7 +526,6 @@ def _truncate(text: str, max_len: int) -> str:
     if max_len > 0 and len(text) > max_len:
         return text[: max_len - 1] + "…"
     return text
-
 
 
 class _PlanDisplay:
@@ -513,7 +629,8 @@ class _PlanDisplay:
         elif self._phase == 2:
             lines.append(f"  {_CYAN}◆{_RESET} Deep-dive investigations")
         else:
-            lines.append(f"  {_GREEN}✓{_RESET} {_DIM}Deep-dive investigations{_RESET}")
+            lines.append(
+                f"  {_GREEN}✓{_RESET} {_DIM}Deep-dive investigations{_RESET}")
 
         # Phase 2 sub-items (only when expanded)
         if self._items:
@@ -607,6 +724,7 @@ async def run_streaming_agent(
     verbose: bool = False,
     model: str = "opus",
     mcp_setup: McpSetup | None = None,
+    output_file: str | None = None,
 ) -> None:
     """Run an agent showing reasoning + tool activity.
 
@@ -620,6 +738,8 @@ async def run_streaming_agent(
     pre-computed values. When None (default), call internal MCP setup
     for backward compatibility.
     """
+    _install_cancel_scope_handler()
+
     is_tty = sys.stderr.isatty()
 
     if mcp_setup is not None:
@@ -627,6 +747,7 @@ async def run_streaming_agent(
         mcp_tools = list(mcp_setup.mcp_tools)
         system_prompt = _inject_prefetched_context(
             system_prompt, mcp_setup.org_context, mcp_setup.security_policy,
+            mcp_setup.review_context,
         )
     else:
         mcp_config = _get_mcp_config()
@@ -650,7 +771,8 @@ async def run_streaming_agent(
                 mcp_config = {}
             else:
                 org_ctx, sec_pol = await _prefetch_mcp_context(api_key)
-                system_prompt = _inject_prefetched_context(system_prompt, org_ctx, sec_pol)
+                system_prompt = _inject_prefetched_context(
+                    system_prompt, org_ctx, sec_pol)
                 mcp_tools = ["mcp__hiro__recall"]
 
     cli_errors: list[str] = []
@@ -659,64 +781,76 @@ async def run_streaming_agent(
         if '"level":"error"' in line or "Error:" in line:
             cli_errors.append(line)
 
+    tools_list = (allowed_tools or []) + mcp_tools
     options = ClaudeAgentOptions(
         cwd=cwd,
-        allowed_tools=(allowed_tools or []) + mcp_tools,
+        tools=tools_list,
+        allowed_tools=tools_list,
         system_prompt=system_prompt,
         mcp_servers=mcp_config,
         permission_mode="acceptEdits",
         max_turns=max_turns,
         model=model,
-        agents={"explore": _EXPLORE_AGENT},
+        effort="medium",
         env=_get_agent_env(),
         stderr=_capture_stderr,
     )
 
     if is_tty:
-        await _run_streaming_tty(options, prompt, allowed_tools, cli_errors)
+        await _run_streaming_tty(options, prompt, allowed_tools, cli_errors, output_file=output_file)
     else:
-        await _run_streaming_plain(options, prompt)
+        await _run_streaming_plain(options, prompt, output_file=output_file)
 
 
 async def _run_streaming_plain(
     options: ClaudeAgentOptions,
     prompt: str,
+    output_file: str | None = None,
 ) -> None:
     """Non-TTY streaming: plain text, no ANSI, no spinner."""
     last_text = ""
 
-    async for message in query(prompt=prompt, options=options):
-        if message is None:
-            continue
+    stream = query(prompt=prompt, options=options)
+    try:
+        async for message in stream:
+            if message is None:
+                continue
 
-        if isinstance(message, UserMessage):
-            blocks = message.content if isinstance(message.content, list) else []
-            for b in blocks:
-                if isinstance(b, ToolResultBlock) and b.is_error:
-                    err_text = b.content if isinstance(b.content, str) else str(b.content)
-                    err_text = _strip_xml_tags(err_text)
-                    if "sibling tool call errored" in err_text.lower():
-                        continue
-                    err_short = err_text[:200].split("\n")[0]
-                    print(f"error: {err_short}", file=sys.stderr, flush=True)
-            continue
+            if isinstance(message, UserMessage):
+                blocks = message.content if isinstance(
+                    message.content, list) else []
+                for b in blocks:
+                    if isinstance(b, ToolResultBlock) and b.is_error:
+                        err_text = b.content if isinstance(
+                            b.content, str) else str(b.content)
+                        err_text = _strip_xml_tags(err_text)
+                        if "sibling tool call errored" in err_text.lower():
+                            continue
+                        err_short = err_text[:200].split("\n")[0]
+                        print(f"error: {err_short}", file=sys.stderr, flush=True)
+                continue
 
-        if not isinstance(message, AssistantMessage):
-            continue
+            if not isinstance(message, AssistantMessage):
+                continue
 
-        for block in message.content:
-            if isinstance(block, TextBlock) and block.text.strip():
-                last_text = block.text
-            elif isinstance(block, ToolUseBlock):
-                inp = block.input if isinstance(block.input, dict) else {}
-                summary = _tool_summary(block.name, inp)
-                print(
-                    f"  {block.name}({summary})",
-                    file=sys.stderr, flush=True,
-                )
+            for block in message.content:
+                if isinstance(block, TextBlock) and block.text.strip():
+                    last_text = block.text
+                elif isinstance(block, ToolUseBlock):
+                    inp = block.input if isinstance(block.input, dict) else {}
+                    summary = _tool_summary(block.name, inp)
+                    print(
+                        f"  {block.name}({summary})",
+                        file=sys.stderr, flush=True,
+                    )
+    finally:
+        await _safe_close_query_stream(stream, context="run_streaming_plain")
 
     if last_text:
-        print(last_text, flush=True)
+        if output_file:
+            Path(output_file).write_text(last_text)
+        else:
+            print(last_text, flush=True)
 
 
 async def _run_streaming_tty(
@@ -724,6 +858,7 @@ async def _run_streaming_tty(
     prompt: str,
     allowed_tools: list[str] | None,
     cli_errors: list[str],
+    output_file: str | None = None,
 ) -> None:
     """TTY streaming: rich output with spinner, ANSI colors, plan display."""
     last_text = ""
@@ -742,17 +877,20 @@ async def _run_streaming_tty(
     if has_tasks:
         plan.start()
 
+    stream = query(prompt=prompt, options=options)
     try:
-        async for message in query(prompt=prompt, options=options):
+        async for message in stream:
             if message is None:
                 continue
 
             # Show tool errors from UserMessage results
             if isinstance(message, UserMessage):
-                blocks = message.content if isinstance(message.content, list) else []
+                blocks = message.content if isinstance(
+                    message.content, list) else []
                 for b in blocks:
                     if isinstance(b, ToolResultBlock) and b.is_error:
-                        err_text = b.content if isinstance(b.content, str) else str(b.content)
+                        err_text = b.content if isinstance(
+                            b.content, str) else str(b.content)
                         err_text = _strip_xml_tags(err_text)
                         if "sibling tool call errored" in err_text.lower():
                             continue
@@ -817,7 +955,8 @@ async def _run_streaming_tty(
             # Show reasoning text
             for tb in text_blocks:
                 last_text = tb.text
-                _freeze_tool(spinner, current_tool_line, repeat_tool, repeat_count)
+                _freeze_tool(spinner, current_tool_line,
+                             repeat_tool, repeat_count)
                 current_tool_line = ""
                 repeat_tool = ""
                 repeat_count = 0
@@ -836,7 +975,8 @@ async def _run_streaming_tty(
                     other_blocks = tool_blocks
 
                 if task_blocks:
-                    _freeze_tool(spinner, current_tool_line, repeat_tool, repeat_count)
+                    _freeze_tool(spinner, current_tool_line,
+                                 repeat_tool, repeat_count)
                     current_tool_line = ""
                     repeat_tool = ""
                     repeat_count = 0
@@ -846,7 +986,8 @@ async def _run_streaming_tty(
                     for b in task_blocks:
                         active_task_ids.add(b.id)
                         inp = b.input if isinstance(b.input, dict) else {}
-                        desc = inp.get("description", inp.get("prompt", ""))[:60]
+                        desc = inp.get(
+                            "description", inp.get("prompt", ""))[:60]
                         task_plan.append((b.id, desc))
                     active_tasks += len(task_blocks)
 
@@ -864,7 +1005,8 @@ async def _run_streaming_tty(
                     groups: dict[str, list[str]] = {}
                     for block in other_blocks:
                         name = block.name
-                        inp = block.input if isinstance(block.input, dict) else {}
+                        inp = block.input if isinstance(
+                            block.input, dict) else {}
                         summary = _tool_summary(name, inp)
                         groups.setdefault(name, []).append(summary)
 
@@ -875,7 +1017,8 @@ async def _run_streaming_tty(
 
                     # Print all groups except the last
                     for name, summaries, line in group_lines[:-1]:
-                        _freeze_tool(spinner, current_tool_line, repeat_tool, repeat_count)
+                        _freeze_tool(spinner, current_tool_line,
+                                     repeat_tool, repeat_count)
                         current_tool_line = ""
                         repeat_tool = ""
                         repeat_count = 0
@@ -889,7 +1032,8 @@ async def _run_streaming_tty(
                         repeat_count += total
                     else:
                         # Different tool — freeze previous, start new
-                        _freeze_tool(spinner, current_tool_line, repeat_tool, repeat_count)
+                        _freeze_tool(spinner, current_tool_line,
+                                     repeat_tool, repeat_count)
                         repeat_tool = last_name
                         repeat_count = total
                         current_tool_line = last_line
@@ -911,7 +1055,10 @@ async def _run_streaming_tty(
         if plan.active:
             plan.finish()
         if last_text:
-            print(last_text, flush=True)
+            if output_file:
+                Path(output_file).write_text(last_text)
+            else:
+                print(last_text, flush=True)
 
         if cli_errors:
             print(f"\n{_DIM}---{_RESET}", file=sys.stderr, flush=True)
@@ -919,6 +1066,7 @@ async def _run_streaming_tty(
                 print(f"{_DIM}{err}{_RESET}", file=sys.stderr, flush=True)
     finally:
         spinner.stop()
+        await _safe_close_query_stream(stream, context="run_streaming_tty")
 
 
 def _strip_xml_tags(text: str) -> str:
@@ -963,7 +1111,6 @@ def _freeze_tool(
         print(tool_line, file=sys.stderr, flush=True)
 
 
-
 def _print_text_block(text: str) -> None:
     """Print agent text to stderr as clean markdown.
 
@@ -978,7 +1125,6 @@ def _print_text_block(text: str) -> None:
     print(file=sys.stderr, flush=True)
 
 
-
 def _tool_summary(name: str, inp: dict) -> str:
     """One-line summary of a tool call for the spinner."""
     if name == "Bash":
@@ -990,7 +1136,13 @@ def _tool_summary(name: str, inp: dict) -> str:
     elif name == "Glob":
         raw = inp.get("pattern", "")
     elif name == "Grep":
-        raw = inp.get("pattern", "")
+        pattern = inp.get("pattern", "")
+        glob = inp.get("glob", "")
+        # When pattern is trivial (e.g. "."), show the glob filter instead
+        if glob and len(pattern) <= 2:
+            raw = glob
+        else:
+            raw = pattern
     elif name == "Task":
         raw = inp.get("description", inp.get("prompt", ""))[:60]
     elif name == "TodoWrite":
@@ -999,7 +1151,8 @@ def _tool_summary(name: str, inp: dict) -> str:
     elif name == "TodoRead":
         raw = "checking progress"
     else:
-        raw = next((v for v in inp.values() if isinstance(v, str) and v), "")[:60]
+        raw = next((v for v in inp.values()
+                   if isinstance(v, str) and v), "")[:60]
 
     raw = " ".join(raw.split())
     width = _get_terminal_width()
@@ -1020,7 +1173,10 @@ async def _run_tracked_agent(
     mcp_setup: McpSetup,
     max_turns: int = 15,
     model: str = "sonnet",
+    effort: str | None = None,
     on_tool: Callable[[str, str, str, bool], None] | None = None,
+    on_tool_event: Callable[[str, str, dict, bool], None] | None = None,
+    on_result: Callable[[ResultMessage], None] | None = None,
     on_text: Callable[[str], None] | None = None,
     on_todos: Callable[[str, list[dict]], None] | None = None,
 ) -> tuple[str, str]:
@@ -1038,12 +1194,15 @@ async def _run_tracked_agent(
     whenever the agent calls ``TodoWrite``, so the display can render
     the investigation checklist.
     """
+    _install_cancel_scope_handler()
+
     full_system = _inject_prefetched_context(
         system_prompt, mcp_setup.org_context, mcp_setup.security_policy,
+        mcp_setup.review_context,
     )
 
     parent_tools = allowed_tools + list(mcp_setup.mcp_tools)
-    # Auto-approve sub-agent tools (Read/Grep/Glob) so explore agents
+    # Auto-approve sub-agent tools (Read/Grep) so explore agents
     # can actually use them — without this they're silently blocked.
     subagent_tools = list(_EXPLORE_AGENT.tools or [])
     options = ClaudeAgentOptions(
@@ -1055,49 +1214,461 @@ async def _run_tracked_agent(
         permission_mode="acceptEdits",
         max_turns=max_turns,
         model=model,
+        effort=effort,
         agents={"explore": _EXPLORE_AGENT},
         env=_get_agent_env(),
-        stderr=lambda _: None,
+        stderr=lambda line: logger.debug("cli_stderr", agent=name, line=line.rstrip()),
+    )
+
+    run_started_at = _time.monotonic()
+    logger.info(
+        "agent_run_started",
+        agent=name,
+        model=model,
+        max_turns=max_turns,
+        effort=effort or "",
+        prompt_chars=len(prompt),
+        system_prompt_chars=len(full_system),
+        parent_tools=len(parent_tools),
+        allowed_tools=len(parent_tools + subagent_tools),
     )
 
     summary = ""
+    all_text_blocks: list[str] = []  # Accumulate all primary agent text
     session_id = ""
     active_task_ids: set[str] = set()  # Track Task sub-agent tool_use_ids
+    tool_start_times: dict[str, float] = {}
+    tool_meta: dict[str, tuple[str, bool, str]] = {}
+    callback_error: BaseException | None = None
+    first_message_s: float | None = None
+    messages_seen = 0
+    assistant_messages = 0
+    user_messages = 0
+    result_messages = 0
+    tool_started_count = 0
+    tool_finished_count = 0
+    tool_error_count = 0
+    # Timeout: break the loop if no messages arrive for this many seconds.
+    # Cannot use asyncio.wait_for — cancelling __anext__() triggers AnyIO
+    # cancel scope errors inside the SDK. Instead, we wrap __anext__() in
+    # asyncio.wait with a timeout, then cancel the orphaned task on stall.
+    # A watchdog also watches for the primary-agent-silent case (sub-agent
+    # chatting but primary stuck) and sets a flag checked after each message.
+    _default_stall_timeout = 120.0 if model == "sonnet" else 300.0
+    try:
+        stall_timeout = float(os.environ.get("HIRO_AGENT_STALL_TIMEOUT", str(_default_stall_timeout)))
+    except ValueError:
+        stall_timeout = _default_stall_timeout
+    try:
+        idle_log_interval = float(os.environ.get("HIRO_AGENT_IDLE_LOG_INTERVAL", "30"))
+    except ValueError:
+        idle_log_interval = 30.0
+    idle_log_interval = max(5.0, idle_log_interval)
+    next_idle_log_at = idle_log_interval
+    last_message_at = _time.monotonic()
+    last_primary_message_at = _time.monotonic()
+    stall_timed_out = False
 
-    async for message in query(prompt=prompt, options=options):
-        if message is None:
-            continue
-        if isinstance(message, UserMessage):
-            # Check for Task sub-agent results completing
-            blocks = message.content if isinstance(message.content, list) else []
-            for b in blocks:
-                if isinstance(b, ToolResultBlock) and b.tool_use_id in active_task_ids:
-                    active_task_ids.discard(b.tool_use_id)
-            if on_tool is not None:
-                on_tool(name, "", "", bool(active_task_ids))
-        elif isinstance(message, AssistantMessage):
-            # If active Task IDs exist, this message is from a sub-agent
-            is_subagent = bool(active_task_ids)
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    summary = block.text
-                    if on_text is not None and block.text.strip():
-                        on_text(block.text)
-                elif isinstance(block, ToolUseBlock):
-                    if block.name == "Task":
-                        active_task_ids.add(block.id)
-                    inp = block.input if isinstance(block.input, dict) else {}
-                    if block.name == "TodoWrite" and on_todos is not None:
-                        todos = inp.get("todos", [])
-                        if todos:
-                            on_todos(name, todos)
-                    if on_tool is not None:
+    def _capture_callback_error(exc: BaseException) -> None:
+        nonlocal callback_error
+        if callback_error is None:
+            callback_error = exc
+
+    stream = query(prompt=prompt, options=options)
+
+    async def _stall_watchdog() -> None:
+        nonlocal stall_timed_out, next_idle_log_at
+        while True:
+            await asyncio.sleep(10)
+            # Use primary agent activity — sub-agent messages should not
+            # reset the stall timer, as the primary agent may be genuinely
+            # stuck while sub-agents chatter.
+            elapsed = _time.monotonic() - last_primary_message_at
+            if elapsed >= next_idle_log_at:
+                logger.info(
+                    "agent_waiting_for_messages",
+                    agent=name,
+                    idle_s=round(elapsed, 1),
+                    timeout_s=stall_timeout,
+                )
+                next_idle_log_at += idle_log_interval
+            if elapsed >= stall_timeout:
+                stall_timed_out = True
+                logger.error(
+                    "agent_stall_timeout",
+                    agent=name,
+                    timeout_s=stall_timeout,
+                    elapsed_s=round(elapsed, 1),
+                )
+                # Don't try to close the stream — aclose() from a different
+                # task triggers "cancel scope in a different task" RuntimeError
+                # and fails silently. The main loop checks stall_timed_out
+                # after each message and breaks.
+                return
+
+    watchdog = asyncio.create_task(_stall_watchdog())
+    run_error: BaseException | None = None
+    try:
+        while True:
+            # Wrap __anext__() in asyncio.wait so we can enforce a hard
+            # per-message timeout without cancelling the stream's scope.
+            _next = asyncio.ensure_future(stream.__anext__())
+            done, _ = await asyncio.wait({_next}, timeout=stall_timeout)
+            if not done:
+                # Hard per-message timeout fired.
+                stall_timed_out = True
+                logger.error(
+                    "agent_stall_timeout",
+                    agent=name,
+                    timeout_s=stall_timeout,
+                    elapsed_s=round(_time.monotonic() - last_primary_message_at, 1),
+                )
+                _next.cancel()
+                with contextlib.suppress(asyncio.CancelledError, RuntimeError, StopAsyncIteration):
+                    await _next
+                break
+            # asyncio.wait returned — get the result (may be StopAsyncIteration).
+            try:
+                message = _next.result()
+            except StopAsyncIteration:
+                break
+            except RuntimeError as exc:
+                # AnyIO cancel-scope cleanup can raise when the SDK generator
+                # exits naturally inside the ensure_future task (different task
+                # than the one that entered the scope). Treat as stream end.
+                if "cancel scope" in str(exc) and "different task" in str(exc):
+                    logger.debug("stream_cancel_scope_on_exit", agent=name, error=str(exc))
+                    break
+                raise
+
+            # Check watchdog flag (primary-agent-silent while sub-agents chatter).
+            if stall_timed_out:
+                break
+
+            now = _time.monotonic()
+            last_message_at = now
+            messages_seen += 1
+            # Reset primary timer for non-sub-agent messages only.
+            # Sub-agent chatter should not mask a stalled primary agent.
+            if not active_task_ids:
+                last_primary_message_at = now
+            if first_message_s is None:
+                first_message_s = now - run_started_at
+                logger.info(
+                    "agent_first_message",
+                    agent=name,
+                    first_message_s=round(first_message_s, 1),
+                )
+            if message is None:
+                continue
+            if isinstance(message, UserMessage):
+                user_messages += 1
+                # Check for Task sub-agent results completing
+                blocks = message.content if isinstance(
+                    message.content, list) else []
+                for b in blocks:
+                    if isinstance(b, ToolResultBlock) and b.tool_use_id in active_task_ids:
+                        active_task_ids.discard(b.tool_use_id)
+                    if isinstance(b, ToolResultBlock):
+                        tool_finished_count += 1
+                        tool_use_id = str(getattr(b, "tool_use_id", "") or "")
+                        started_at = tool_start_times.pop(tool_use_id, None)
+                        tool_name, tool_is_subagent, tool_summary = tool_meta.pop(
+                            tool_use_id,
+                            ("unknown", bool(active_task_ids), ""),
+                        )
+                        is_error = bool(getattr(b, "is_error", False))
+                        if is_error:
+                            tool_error_count += 1
+                        logger.info(
+                            "agent_tool_finished",
+                            agent=name,
+                            tool=tool_name,
+                            tool_use_id=tool_use_id,
+                            is_subagent=tool_is_subagent,
+                            status="error" if is_error else "ok",
+                            duration_s=(
+                                round(now - started_at, 3)
+                                if started_at is not None
+                                else None
+                            ),
+                            elapsed_s=round(now - run_started_at, 1),
+                            summary=tool_summary,
+                        )
+                if on_tool is not None:
+                    try:
+                        on_tool(name, "", "", bool(active_task_ids))
+                    except BaseException as exc:
+                        _capture_callback_error(exc)
+                        break
+            elif isinstance(message, AssistantMessage):
+                assistant_messages += 1
+                # If active Task IDs exist, this message is from a sub-agent
+                is_subagent = bool(active_task_ids)
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        summary = block.text
+                        if not is_subagent and block.text.strip():
+                            all_text_blocks.append(block.text)
+                        if on_text is not None and block.text.strip():
+                            try:
+                                on_text(block.text)
+                            except BaseException as exc:
+                                _capture_callback_error(exc)
+                                break
+                    elif isinstance(block, ToolUseBlock):
+                        if block.name == "Task":
+                            active_task_ids.add(block.id)
+                        inp = block.input if isinstance(block.input, dict) else {}
                         tool_summary = _tool_summary(block.name, inp)
-                        on_tool(name, block.name, tool_summary, is_subagent)
-        elif isinstance(message, ResultMessage):
-            session_id = message.session_id
+                        tool_started_count += 1
+                        tool_start_times[block.id] = now
+                        tool_meta[block.id] = (block.name, is_subagent, tool_summary)
+                        logger.info(
+                            "agent_tool_started",
+                            agent=name,
+                            tool=block.name,
+                            tool_use_id=block.id,
+                            is_subagent=is_subagent,
+                            summary=tool_summary,
+                            elapsed_s=round(now - run_started_at, 1),
+                        )
+                        if on_tool_event is not None:
+                            try:
+                                on_tool_event(name, block.name, inp, is_subagent)
+                            except BaseException as exc:
+                                _capture_callback_error(exc)
+                                break
+                        if block.name == "TodoWrite" and on_todos is not None:
+                            todos = inp.get("todos", [])
+                            if todos:
+                                try:
+                                    on_todos(name, todos)
+                                except BaseException as exc:
+                                    _capture_callback_error(exc)
+                                    break
+                        if on_tool is not None:
+                            try:
+                                on_tool(name, block.name, tool_summary, is_subagent)
+                            except BaseException as exc:
+                                _capture_callback_error(exc)
+                                break
+                if callback_error is not None:
+                    break
+            elif isinstance(message, ResultMessage):
+                result_messages += 1
+                session_id = message.session_id
+                logger.info(
+                    "agent_result_received",
+                    agent=name,
+                    subtype=str(message.subtype or ""),
+                    num_turns=message.num_turns,
+                    is_error=message.is_error,
+                    duration_ms=message.duration_ms,
+                    elapsed_s=round(now - run_started_at, 1),
+                )
+                if on_result is not None:
+                    try:
+                        on_result(message)
+                    except BaseException as exc:
+                        _capture_callback_error(exc)
+                        break
+    except BaseException as exc:
+        run_error = exc
+        raise
+    finally:
+        watchdog.cancel()
+        try:
+            await watchdog
+        except (asyncio.CancelledError, RuntimeError):
+            pass
+        await _safe_close_query_stream(stream, context=f"run_tracked_agent:{name}")
+        logger.info(
+            "agent_run_finished",
+            agent=name,
+            total_s=round(_time.monotonic() - run_started_at, 1),
+            first_message_s=round(first_message_s, 1) if first_message_s is not None else None,
+            messages_seen=messages_seen,
+            assistant_messages=assistant_messages,
+            user_messages=user_messages,
+            result_messages=result_messages,
+            tool_started=tool_started_count,
+            tool_finished=tool_finished_count,
+            tool_errors=tool_error_count,
+            tools_inflight=len(tool_start_times),
+            active_tasks=len(active_task_ids),
+            stall_timed_out=stall_timed_out,
+            callback_error=callback_error is not None,
+            error_type=(
+                type(run_error).__name__
+                if run_error is not None
+                else (type(callback_error).__name__ if callback_error is not None else "")
+            ),
+        )
 
-    return summary, session_id
+    if stall_timed_out:
+        raise TimeoutError(f"Agent '{name}' stalled for {stall_timeout}s with no messages")
+
+    if callback_error is not None:
+        raise callback_error
+
+    # Return all accumulated text from the primary agent, joined.
+    # Falls back to last TextBlock if nothing was accumulated.
+    full_output = "\n\n".join(all_text_blocks) if all_text_blocks else summary
+    return full_output, session_id
+
+
+def _find_ignored_segment(value: str) -> str | None:
+    """Return the ignored path segment if present in a path/pattern string."""
+    raw = value.strip().strip("`\"'")
+    if not raw:
+        return None
+    cleaned = raw.replace("\\", "/")
+    for part in re.split(r"/+", cleaned):
+        part = part.strip()
+        if not part or part in {"*", "**", ".", ".."}:
+            continue
+        if part in IGNORED_DIRS:
+            return part
+    return None
+
+
+def get_tool_policy_violation(
+    *,
+    tool_name: str,
+    tool_input: dict,
+    forbid_structure_discovery: bool = False,
+) -> tuple[str, str] | None:
+    """Return (path_or_pattern, reason) when a tool call violates file-scope policy."""
+    if tool_name == "Read":
+        file_path = str(tool_input.get("file_path", "")).strip()
+        ignored = _find_ignored_segment(file_path)
+        if ignored:
+            return file_path, f"read into ignored directory `{ignored}` is blocked"
+        return None
+
+    if tool_name not in {"Grep", "Glob"}:
+        return None
+
+    path_value = str(tool_input.get("path", "")).strip()
+    pattern_value = str(tool_input.get("pattern", "")).strip()
+
+    for candidate in (path_value, pattern_value):
+        ignored = _find_ignored_segment(candidate)
+        if ignored:
+            return candidate, f"{tool_name} into ignored directory `{ignored}` is blocked"
+
+    if forbid_structure_discovery and tool_name == "Glob":
+        broad_patterns = {
+            "**/*.py",
+            "**/*.ts",
+            "**/*.js",
+            "**/*.go",
+            "**/*.java",
+            "**/*.rb",
+            "**/*.php",
+            "**/*.cs",
+            "**/*.swift",
+            "**/*.kt",
+        }
+        if pattern_value in broad_patterns:
+            return pattern_value, "repository-wide structure discovery is blocked; use shared index"
+
+    if tool_name == "Glob" and pattern_value.strip() == "**/*":
+        return pattern_value, "greedy Glob(\"**/*\") is blocked"
+
+    return None
+
+
+class ToolPolicyViolationError(RuntimeError):
+    """Raised when a tool call violates first-party file-scope policy."""
+
+    def __init__(self, path: str, reason: str, *, tool_name: str = "") -> None:
+        super().__init__(path)
+        self.path = path
+        self.reason = reason
+        self.tool_name = tool_name
+
+
+class _ScopeViolationError(ToolPolicyViolationError):
+    """Raised when a sub-agent read escapes the current allowed scope."""
+
+
+_NON_INVESTIGATION_TODO_MARKERS: tuple[str, ...] = (
+    "scratchpad",
+    "todo",
+    "checklist",
+    "write findings",
+    "save findings",
+    "record findings",
+    "final write",
+    "update findings",
+    "summarize findings",
+    "summarize notes",
+)
+
+
+def _is_investigation_todo(todo: dict) -> bool:
+    """Return True when a todo item describes investigation work."""
+    content = str(todo.get("content", "")).strip().lower()
+    if not content:
+        return False
+    return not any(marker in content for marker in _NON_INVESTIGATION_TODO_MARKERS)
+
+
+def _filter_investigation_todos(todos: list[dict]) -> list[dict]:
+    """Drop housekeeping/plumbing todos and keep investigation-focused items."""
+    return [todo for todo in todos if isinstance(todo, dict) and _is_investigation_todo(todo)]
+
+
+_TURN_LIMIT_MARKERS: tuple[str, ...] = (
+    "max_turns",
+    "max turns",
+    "turn limit",
+    "turn_limit",
+    "turns exhausted",
+)
+
+
+def _is_true_turn_limit(result: ResultMessage, *, max_turns: int) -> tuple[bool, str]:
+    """Classify whether a ResultMessage indicates true turn-budget truncation.
+
+    We intentionally avoid using ``num_turns >= max_turns`` alone because agents can
+    finish successfully exactly at budget without being truncated.
+    """
+    subtype = str(getattr(result, "subtype", "") or "").strip().lower()
+    result_text = str(getattr(result, "result", "") or "").strip().lower()
+
+    if any(marker in subtype for marker in _TURN_LIMIT_MARKERS):
+        return True, f"subtype={subtype or 'unknown'}"
+    if result_text and any(marker in result_text for marker in _TURN_LIMIT_MARKERS):
+        return True, "result_text_hint"
+    if result.num_turns > max_turns:
+        # Defensive fallback for unexpected SDK counting behavior.
+        return True, f"num_turns>{max_turns}"
+
+    return False, "no_turn_limit_signal"
+
+
+def _read_skill_findings(findings_dir: Path, name: str) -> list[dict]:
+    """Read all finding-{name}-*.json files, return parsed dicts."""
+    findings = []
+    for path in sorted(findings_dir.glob(f"finding-{name}-*.json")):
+        try:
+            findings.append(json.loads(path.read_text()))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return findings
+
+
+def _format_prior_findings(findings: list[dict]) -> str:
+    """Format prior findings as a brief list for the next wave prompt."""
+    if not findings:
+        return ""
+    lines = ["## Prior Findings (already recorded — do not re-report)"]
+    for f in findings:
+        lines.append(f"- {f.get('location', '?')} — {f.get('issue', '?')}")
+    return "\n".join(lines)
 
 
 async def _run_skill_waves(
@@ -1105,27 +1676,99 @@ async def _run_skill_waves(
     name: str,
     system_prompt: str,
     skill_prompt: str,
-    scratchpad_path: Path,
+    findings_dir: Path,
     cwd: str | None,
     mcp_setup: McpSetup,
-    waves: int = 2,
-    turns_per_wave: int = 8,
-    model: str = "opus",
+    waves: int | None = None,
+    turns_per_wave: int | None = None,
+    model: str = "sonnet",
+    effort: str | None = "medium",
     on_tool: Callable[[str, str, str, bool], None] | None = None,
     on_text: Callable[[str], None] | None = None,
     on_todos: Callable[[str, list[dict]], None] | None = None,
+    run_stats: dict[str, object] | None = None,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[str, int]:
-    """Run a skill investigation in multiple waves with scratchpad compaction.
+    """Run a skill investigation in multiple waves with per-finding JSON files.
 
-    Each wave starts a fresh agent session, carrying only the compacted
-    scratchpad from prior waves. This keeps peak context per wave at ~40K
-    tokens instead of 100K+.
+    Each wave starts a fresh agent session. Prior findings are injected as
+    a brief summary list. After all waves, findings are read directly from
+    JSON files — no compaction, no synthesis.
 
-    Returns (synthesis_result, total_tool_calls).
+    Returns (formatted_findings, total_tool_calls).
     """
-    from hiro_agent.prompts import SKILL_SYNTHESIS_PROMPT
+
+    def _default_waves_for_mode(mode: str) -> int:
+        if mode == "trace":
+            return 2
+        if mode == "breadth":
+            return 1
+        # hybrid = 1 breadth + N trace
+        return 3
+
+    def _turn_budget_for_mode(mode: str, override: int | None) -> int:
+        if override is not None:
+            return override
+        # Sonnet is fast — more turns per wave cost less wall-clock time.
+        return 14 if mode == "breadth" else 20
+
+    def _has_pending_untraced_edges() -> bool:
+        state_path = findings_dir / f"{name}-state.md"
+        if not state_path.exists():
+            return False
+        for line in state_path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("UNTRACED_EDGE|"):
+                return True
+        return False
 
     total_tool_calls = 0
+    policy = get_skill_gate_policy(name)
+    all_first_party_files = list_first_party_files(cwd)
+    starter_files = build_seed_scope(
+        name,
+        cwd=cwd,
+        context_text=skill_prompt,
+        max_seeds=policy.max_seed_files,
+        all_files=all_first_party_files,
+    )
+    allowed_files = set(starter_files)
+    requested_waves = max(1, waves) if waves is not None else _default_waves_for_mode(policy.mode)
+    turn_override = max(1, turns_per_wave) if turns_per_wave is not None else None
+    effective_waves, wave_modes = resolve_wave_modes(policy, requested_waves)
+    if effective_waves != requested_waves:
+        logger.info(
+            "skill_wave_override",
+            skill=name,
+            mode=policy.mode,
+            requested_waves=requested_waves,
+            effective_waves=effective_waves,
+        )
+    wave_plan = list(wave_modes)
+    logger.info(
+        "skill_wave_plan",
+        skill=name,
+        mode=policy.mode,
+        requested_waves=requested_waves,
+        effective_waves=len(wave_plan),
+        wave_modes=list(wave_plan),
+        turn_override=turn_override,
+        seed_files=len(starter_files),
+    )
+
+    used_expansions = 0
+    seen_ticket_keys: set[str] = set()
+    gate_feedback = ""
+    blocked_scope_reads = 0
+    breadth_read_files: set[str] = set()
+    current_wave_mode = wave_plan[0] if wave_plan else "trace"
+    latest_todos: list[dict] = []
+    expansion_followups: dict[str, bool] = {}
+    turn_limited = False
+    turn_limited_waves = 0
+    turn_limited_reasons: list[str] = []
+    continuation_wave_used = False
+    findings_dir_resolved = findings_dir.resolve()
+    state_path_resolved = (findings_dir / f"{name}-state.md").resolve()
 
     def _counting_on_tool(agent_name: str, tool_name: str, summary: str, is_subagent: bool) -> None:
         nonlocal total_tool_calls
@@ -1134,78 +1777,436 @@ async def _run_skill_waves(
         if on_tool is not None:
             on_tool(agent_name, tool_name, summary, is_subagent)
 
-    # Inject turn budget into system prompt
-    system_prompt = system_prompt.replace("{turns_per_wave}", str(turns_per_wave))
+    def _combined_todos() -> list[dict]:
+        combined = list(latest_todos)
+        for idx, path in enumerate(sorted(expansion_followups)):
+            combined.append(
+                {
+                    "id": f"expand:{idx + 1}",
+                    "content": f"Follow approved expansion target: {path}",
+                    "status": "completed" if expansion_followups[path] else "pending",
+                }
+            )
+        return combined
 
-    for wave in range(waves):
-        # Build prompt: skill_prompt + prior scratchpad contents
-        parts = [skill_prompt]
-        if scratchpad_path.exists():
-            prior = scratchpad_path.read_text()
-            if prior.strip():
-                parts.append(f"\n## Prior Findings (from scratchpad)\n\n{prior}")
+    def _emit_todos() -> None:
+        if on_todos is None:
+            return
+        todos = _combined_todos()
+        if todos:
+            on_todos(name, todos)
+
+    def _capturing_todos(agent_name: str, todos: list[dict]) -> None:
+        nonlocal latest_todos
+        incoming = _filter_investigation_todos(todos)
+        # Merge instead of replace so checklist counts don't shrink when the
+        # model rewrites TodoWrite with a shorter subset mid-run.
+        def _todo_key(todo: dict) -> str:
+            content = str(todo.get("content", "")).strip()
+            if content:
+                return f"content:{content.lower()}"
+            todo_id = str(todo.get("id", "")).strip()
+            if todo_id:
+                return f"id:{todo_id}"
+            return f"raw:{json.dumps(todo, sort_keys=True)}"
+
+        status_rank = {"pending": 0, "in_progress": 1, "completed": 2}
+        existing_by_key: dict[str, dict] = {}
+        ordered_keys: list[str] = []
+        for todo in latest_todos:
+            if not isinstance(todo, dict):
+                continue
+            key = _todo_key(todo)
+            if key in existing_by_key:
+                continue
+            existing_by_key[key] = dict(todo)
+            ordered_keys.append(key)
+
+        for todo in incoming:
+            key = _todo_key(todo)
+            prev = existing_by_key.get(key, {})
+            merged = dict(prev)
+            merged.update(todo)
+            prev_status = str(prev.get("status", "pending"))
+            new_status = str(todo.get("status", "pending"))
+            merged["status"] = (
+                prev_status
+                if status_rank.get(prev_status, 0) >= status_rank.get(new_status, 0)
+                else new_status
+            )
+            existing_by_key[key] = merged
+            if key not in ordered_keys:
+                ordered_keys.append(key)
+
+        latest_todos = [existing_by_key[key] for key in ordered_keys if key in existing_by_key]
+        _emit_todos()
+
+    def _is_allowed_internal_read(file_path: str) -> bool:
+        """Allow only the current skill's scratchpad state/findings reads."""
+        raw = str(file_path or "").strip().strip("`\"'")
+        if not raw:
+            return False
+
+        root = Path(cwd or ".").resolve()
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            return False
+
+        if resolved == state_path_resolved:
+            return True
+        return (
+            resolved.parent == findings_dir_resolved
+            and resolved.name.startswith(f"finding-{name}-")
+            and resolved.suffix == ".json"
+        )
+
+    def _enforce_scope(agent_name: str, tool_name: str, tool_input: dict, is_subagent: bool) -> None:
+        if tool_name == "Read":
+            file_path = str(tool_input.get("file_path", ""))
+            if _is_allowed_internal_read(file_path):
+                return
+
+        # Enforce scope on all tool calls (skill agents read directly).
+        violation = get_tool_policy_violation(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            forbid_structure_discovery=True,
+        )
+        if violation is not None:
+            blocked_path, reason = violation
+            raise _ScopeViolationError(
+                blocked_path, reason, tool_name=tool_name)
+        if tool_name != "Read":
+            return
+        file_path = str(tool_input.get("file_path", ""))
+        normalized = normalize_tool_read_path(file_path, cwd=cwd)
+        if not normalized:
+            return
+        if normalized in expansion_followups and not expansion_followups[normalized]:
+            expansion_followups[normalized] = True
+            _emit_todos()
+        if current_wave_mode == "breadth":
+            breadth_read_files.add(normalized)
+            if len(breadth_read_files) > policy.max_breadth_files:
+                raise _ScopeViolationError(
+                    normalized, "breadth file budget exceeded")
+            return
+        if allowed_files and normalized not in allowed_files:
+            raise _ScopeViolationError(normalized, "blocked out-of-scope read")
+
+    base_system_prompt = system_prompt
+    wave = 0
+    while wave < len(wave_plan):
+        current_wave_mode = wave_plan[wave]
+        wave_turn_budget = _turn_budget_for_mode(current_wave_mode, turn_override)
+        wave_started_at = _time.monotonic()
+        wave_tool_calls_before = total_tool_calls
+        wave_status = "completed"
+        wave_error: BaseException | None = None
+        wave_turn_limited = False
+        wave_turn_count = 0
+        wave_turn_limit_reason = ""
+        wave_result_subtype = ""
+
+        def _on_result(result: ResultMessage) -> None:
+            nonlocal wave_turn_limited, wave_turn_count, wave_turn_limit_reason, wave_result_subtype
+            wave_turn_count = result.num_turns
+            wave_result_subtype = str(result.subtype or "")
+            wave_turn_limited, wave_turn_limit_reason = _is_true_turn_limit(
+                result,
+                max_turns=wave_turn_budget,
+            )
+
+        wave_system_prompt = base_system_prompt.replace(
+            "{turns_per_wave}", str(wave_turn_budget))
+
+        if policy.mode == "hybrid" and wave == 1:
+            trace_context = skill_prompt
+            state_path = findings_dir / f"{name}-state.md"
+            if state_path.exists():
+                trace_context = f"{trace_context}\n{state_path.read_text()}"
+            prior = _read_skill_findings(findings_dir, name)
+            if prior:
+                trace_context = f"{trace_context}\n" + "\n".join(
+                    f.get("location", "") for f in prior
+                )
+            if breadth_read_files:
+                trace_context = f"{trace_context}\n" + \
+                    "\n".join(sorted(breadth_read_files))
+            reseeded = build_seed_scope(
+                name,
+                cwd=cwd,
+                context_text=trace_context,
+                max_seeds=policy.max_seed_files,
+                all_files=all_first_party_files,
+            )
+            if reseeded:
+                allowed_files = set(reseeded)
+            elif breadth_read_files:
+                allowed_files = set(sorted(breadth_read_files)[
+                                    : policy.max_seed_files])
+
+        scoped_files = starter_files if current_wave_mode == "breadth" else sorted(
+            allowed_files)
+        logger.info(
+            "skill_wave_started",
+            skill=name,
+            wave=wave + 1,
+            total_waves=len(wave_plan),
+            mode=current_wave_mode,
+            max_turns=wave_turn_budget,
+            allowed_file_count=len(scoped_files),
+            allowed_file_preview=scoped_files[:8],
+            pending_expansion_followups=sum(
+                1 for done in expansion_followups.values() if not done
+            ),
+            findings_so_far=len(_read_skill_findings(findings_dir, name)),
+        )
+        gate_block = render_scope_gate_block(
+            skill_name=name,
+            policy=policy,
+            mode=current_wave_mode,
+            wave_index=wave,
+            total_waves=len(wave_plan),
+            allowed_files=scoped_files,
+            used_expansions=used_expansions,
+            feedback=gate_feedback,
+        )
+
+        # Build prompt: skill_prompt + current scope contract + prior notes
+        parts = [skill_prompt, gate_block]
+        pending_followups = sorted(
+            path for path, done in expansion_followups.items() if not done
+        )
+        if pending_followups:
+            parts.append(
+                "## Approved Expansion Follow-ups\n\n"
+                "From previous waves, the following expansion targets were approved. "
+                "Update TodoWrite to include them and trace each target this wave:\n"
+                + "\n".join(f"- {path}" for path in pending_followups)
+            )
+        prior = _read_skill_findings(findings_dir, name)
+        if prior:
+            parts.append(_format_prior_findings(prior))
 
         wave_prompt = "\n".join(parts)
 
-        await _run_tracked_agent(
-            name=name,
-            prompt=wave_prompt,
-            system_prompt=system_prompt,
-            cwd=cwd,
-            allowed_tools=SKILL_TOOLS,
-            mcp_setup=mcp_setup,
-            max_turns=turns_per_wave,
-            model=model,
-            on_tool=_counting_on_tool,
-            on_text=on_text,
-            on_todos=on_todos,
-        )
-
-        # Between waves: compact scratchpad if it's large
-        if wave < waves - 1 and scratchpad_path.exists():
-            content = scratchpad_path.read_text()
-            if len(content) > 2000:
-                compact_mcp = McpSetup(mcp_config={})
-                compacted, _ = await _run_tracked_agent(
-                    name=f"{name}-compact",
-                    prompt=(
-                        "Compress the following security investigation notes into a "
-                        "concise summary. Preserve ALL findings: file paths, line "
-                        "numbers, severity, what was found. Drop verbose descriptions "
-                        "and filler. Output only the compressed notes.\n\n"
-                        f"{content}"
-                    ),
-                    system_prompt="You are a concise technical summarizer. Output only the compressed notes.",
-                    cwd=cwd,
-                    allowed_tools=[],
-                    mcp_setup=compact_mcp,
-                    max_turns=1,
-                    model="sonnet",
+        # Per-wave semaphore: acquire a slot before running the agent,
+        # release between waves so other skills can start.
+        if semaphore is not None:
+            await semaphore.acquire()
+        try:
+            await _run_tracked_agent(
+                name=name,
+                prompt=wave_prompt,
+                system_prompt=wave_system_prompt,
+                cwd=cwd,
+                allowed_tools=SKILL_TOOLS,
+                mcp_setup=mcp_setup,
+                max_turns=wave_turn_budget,
+                model=model,
+                effort=effort,
+                on_tool=_counting_on_tool,
+                on_tool_event=_enforce_scope,
+                on_result=_on_result,
+                on_text=on_text,
+                on_todos=_capturing_todos,
+            )
+        except _ScopeViolationError as exc:
+            wave_status = "scope_violation"
+            blocked_scope_reads += 1
+            logger.warning(
+                "scope_violation_blocked",
+                skill=name,
+                wave=wave + 1,
+                path=exc.path,
+                mode=current_wave_mode,
+                reason=exc.reason,
+            )
+            state_path = findings_dir / f"{name}-state.md"
+            findings_dir.mkdir(parents=True, exist_ok=True)
+            with state_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"\nUNTRACED_EDGE|{exc.reason}|"
+                    f"{exc.path}\n"
                 )
-                if compacted.strip():
-                    scratchpad_path.write_text(compacted)
+        except TimeoutError as exc:
+            wave_status = "stall_timeout"
+            wave_turn_limited = True
+            logger.warning(
+                "skill_wave_stall_timeout",
+                skill=name,
+                wave=wave + 1,
+                error=str(exc),
+            )
+        except BaseException as exc:
+            wave_status = "error"
+            wave_error = exc
+            raise
+        finally:
+            if semaphore is not None:
+                semaphore.release()
+            logger.info(
+                "skill_wave_finished",
+                skill=name,
+                wave=wave + 1,
+                total_waves=len(wave_plan),
+                mode=current_wave_mode,
+                status=wave_status,
+                duration_s=round(_time.monotonic() - wave_started_at, 1),
+                tool_calls=total_tool_calls - wave_tool_calls_before,
+                num_turns=wave_turn_count,
+                max_turns=wave_turn_budget,
+                turn_limited=wave_turn_limited,
+                turn_limited_reason=wave_turn_limit_reason,
+                subtype=wave_result_subtype,
+                error_type=type(wave_error).__name__ if wave_error is not None else "",
+            )
 
-    # Synthesis: read scratchpad, produce final findings
-    scratchpad_content = ""
-    if scratchpad_path.exists():
-        scratchpad_content = scratchpad_path.read_text().strip()
+        if wave_turn_limited:
+            turn_limited = True
+            turn_limited_waves += 1
+            turn_limited_reasons.append(
+                f"wave={wave + 1}|mode={current_wave_mode}|reason={wave_turn_limit_reason}"
+            )
+            logger.warning(
+                "skill_wave_turn_limited",
+                skill=name,
+                wave=wave + 1,
+                mode=current_wave_mode,
+                num_turns=wave_turn_count,
+                max_turns=wave_turn_budget,
+                subtype=wave_result_subtype,
+                reason=wave_turn_limit_reason,
+            )
+        elif wave_turn_count >= wave_turn_budget:
+            logger.info(
+                "skill_wave_completed_at_budget",
+                skill=name,
+                wave=wave + 1,
+                mode=current_wave_mode,
+                num_turns=wave_turn_count,
+                max_turns=wave_turn_budget,
+                subtype=wave_result_subtype,
+            )
 
-    if not scratchpad_content:
-        return "No findings recorded.", total_tool_calls
+        # Process newly requested EXPAND tickets only in trace waves.
+        state_path = findings_dir / f"{name}-state.md"
+        if current_wave_mode == "trace" and state_path.exists():
+            content = state_path.read_text()
+            tickets = parse_expand_requests(content)
+            decisions, used_expansions = evaluate_expansion_requests(
+                tickets,
+                policy=policy,
+                allowed_files=allowed_files,
+                seen_request_keys=seen_ticket_keys,
+                cwd=cwd,
+                used_expansions=used_expansions,
+            )
+            gate_feedback = format_expansion_feedback(
+                decisions=decisions,
+                policy=policy,
+                used_expansions=used_expansions,
+            )
+            for decision in decisions:
+                if decision.approved and decision.approved_path:
+                    expansion_followups.setdefault(decision.approved_path, False)
+            if decisions:
+                _emit_todos()
+        elif current_wave_mode == "breadth":
+            gate_feedback = (
+                "Breadth mode active. EXPAND tickets are optional and "
+                "will only be processed in trace waves."
+            )
 
-    compact_mcp = McpSetup(mcp_config={})
-    synthesis, _ = await _run_tracked_agent(
-        name=f"{name}-synthesis",
-        prompt=scratchpad_content,
-        system_prompt=SKILL_SYNTHESIS_PROMPT,
-        cwd=cwd,
-        allowed_tools=[],
-        mcp_setup=compact_mcp,
-        max_turns=1,
-        model="sonnet",
+        is_last_wave = wave == len(wave_plan) - 1
+        followups_remaining = any(not done for done in expansion_followups.values())
+        todos_remaining = any(
+            t.get("status", "pending") != "completed"
+            for t in latest_todos
+            if isinstance(t, dict)
+        ) or followups_remaining
+        untraced_remaining = _has_pending_untraced_edges()
+
+        # One guarded continuation wave when the agent was cut off at turn cap
+        # and still has explicitly recorded unfinished work.
+        if (
+            is_last_wave
+            and wave_turn_limited
+            and not continuation_wave_used
+            and (todos_remaining or untraced_remaining)
+        ):
+            continuation_mode = "breadth" if current_wave_mode == "breadth" else "trace"
+            wave_plan.append(continuation_mode)
+            continuation_wave_used = True
+            logger.info(
+                "skill_auto_continuation_queued",
+                skill=name,
+                mode=continuation_mode,
+                todos_remaining=todos_remaining,
+                untraced_remaining=untraced_remaining,
+                next_wave=len(wave_plan),
+            )
+
+        # Between waves: no compaction needed — prior findings are
+        # injected as a brief list from the JSON files at wave start.
+        wave += 1
+
+    logger.info(
+        "skill_scope_gating",
+        skill=name,
+        mode=policy.mode,
+        waves=len(wave_plan),
+        default_waves=requested_waves,
+        default_turn_override=turn_override,
+        turn_limited=turn_limited,
+        turn_limited_waves=turn_limited_waves,
+        turn_limited_reasons=turn_limited_reasons,
+        continuation_wave_used=continuation_wave_used,
+        seed_files=len(allowed_files),
+        expansions_used=used_expansions,
+        scope_blocks=blocked_scope_reads,
+        breadth_files_read=len(breadth_read_files),
     )
 
-    return synthesis or "No findings recorded.", total_tool_calls
+    # Read findings directly from JSON files — no synthesis needed.
+    findings = _read_skill_findings(findings_dir, name)
+
+    if run_stats is not None:
+        run_stats.clear()
+        run_stats.update(
+            {
+                "planned_waves": requested_waves,
+                "executed_waves": len(wave_plan),
+                "turn_limited": turn_limited,
+                "turn_limited_waves": turn_limited_waves,
+                "turn_limited_reasons": list(turn_limited_reasons),
+                "continuation_wave_used": continuation_wave_used,
+                "has_pending_todos": any(
+                    t.get("status", "pending") != "completed"
+                    for t in latest_todos
+                    if isinstance(t, dict)
+                ) or any(not done for done in expansion_followups.values()),
+                "has_untraced_edges": _has_pending_untraced_edges(),
+                "pending_expansion_followups": sum(
+                    1 for done in expansion_followups.values() if not done
+                ),
+                "policy_mode": policy.mode,
+            }
+        )
+
+    if not findings:
+        return "No findings recorded.", total_tool_calls
+
+    formatted = "\n\n".join(
+        f"- **{f.get('severity', '?')}** {f.get('location', '?')} — {f.get('issue', '?')}"
+        for f in findings
+    )
+    return formatted, total_tool_calls
 
 
 async def _run_report_stream(
@@ -1215,10 +2216,14 @@ async def _run_report_stream(
     mcp_setup: McpSetup,
     model: str = "opus",
     is_tty: bool = True,
+    output_file: str | None = None,
 ) -> None:
-    """Stream the final report to stdout. No tools, single turn."""
+    """Stream the final report to stdout (or a file via ``output_file``). No tools, single turn."""
+    _install_cancel_scope_handler()
+
     full_system = _inject_prefetched_context(
         system_prompt, mcp_setup.org_context, mcp_setup.security_policy,
+        mcp_setup.review_context,
     )
 
     options = ClaudeAgentOptions(
@@ -1228,8 +2233,9 @@ async def _run_report_stream(
         permission_mode="acceptEdits",
         max_turns=1,
         model=model,
+        effort="medium",
         env=_get_agent_env(),
-        stderr=lambda _: None,
+        stderr=lambda line: logger.debug("cli_stderr", agent="report", line=line.rstrip()),
     )
 
     # Show a spinner with elapsed timer while waiting for first text
@@ -1257,8 +2263,10 @@ async def _run_report_stream(
     tick_task = asyncio.create_task(_update_thinking()) if is_tty else None
     first_text = True
 
+    out_fh = open(output_file, "w") if output_file else None  # noqa: SIM115
+    stream = query(prompt=prompt, options=options)
     try:
-        async for message in query(prompt=prompt, options=options):
+        async for message in stream:
             if message is None:
                 continue
             if isinstance(message, AssistantMessage):
@@ -1270,340 +2278,21 @@ async def _run_report_stream(
                             if tick_task:
                                 tick_task.cancel()
                             first_text = False
-                        print(block.text, flush=True)
+                        if out_fh:
+                            out_fh.write(block.text + "\n")
+                            out_fh.flush()
+                        else:
+                            print(block.text, flush=True)
     finally:
+        await _safe_close_query_stream(stream, context="run_report_stream")
         if tick_task:
             tick_task.cancel()
         if spinner:
             spinner.stop()
+        if out_fh:
+            out_fh.close()
 
 
-_DEBOUNCE_MS = 50
 
-
-class _ScanDisplay:
-    """Live scan display with per-agent status lines.
-
-    Thread-safe: uses a lock for concurrent updates from 8 agents.
-    """
-
-    # States: pending='○', running='◆', completed='✓'
-
-    def __init__(self, skill_names: list[str]) -> None:
-        self._skill_names = list(skill_names)
-        self._phase = 0  # 0=init, 1=recon, 2=investigations, 3=report, 4=done
-        self._agent_status: dict[str, str] = {n: "pending" for n in skill_names}
-        self._agent_tool: dict[str, str] = {}  # name -> "ToolName(summary)"
-        self._agent_subtool: dict[str, str] = {}  # name -> sub-agent's current tool
-        self._agent_subname: dict[str, str] = {}  # name -> sub-agent type (e.g. "explore")
-        self._recon_tool_info: str = ""  # current tool during recon
-        self._recon_thinking_since: float = 0.0  # monotonic time when recon started thinking
-        self._recon_todos: list[dict] = []  # recon's TodoWrite plan
-        self._agent_thinking_since: dict[str, float] = {}  # name -> monotonic time
-        self._agent_subagent_since: dict[str, float] = {}  # name -> when sub-agent started
-        self._agent_todos: dict[str, list[dict]] = {}
-        self._lines_on_screen = 0
-        self._lock = threading.Lock()
-        self._last_render = 0.0
-        self._investigations_start: float = 0.0
-        self._tick_task: asyncio.Task | None = None
-
-    # -- phase transitions ---------------------------------------------------
-
-    def start_recon(self) -> None:
-        with self._lock:
-            self._phase = 1
-            self._render()
-        self._start_tick()
-
-    def start_investigations(self) -> None:
-        with self._lock:
-            self._phase = 2
-            self._recon_tool_info = ""
-            self._investigations_start = _time.monotonic()
-            for n in self._skill_names:
-                self._agent_status[n] = "pending"
-            self._render()
-        self._start_tick()
-
-    def _start_tick(self) -> None:
-        """Start a background task to update the elapsed timer every second."""
-        if self._tick_task is not None:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._tick_task = loop.create_task(self._tick_loop())
-
-    async def _tick_loop(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(1)
-                with self._lock:
-                    if self._phase not in (1, 2):
-                        break
-                    self._render()
-        except asyncio.CancelledError:
-            pass
-
-    def start_report(self) -> None:
-        """Finalize the display permanently, then report streams below."""
-        if self._tick_task:
-            self._tick_task.cancel()
-            self._tick_task = None
-        with self._lock:
-            self._phase = 4  # jump to done — all ✓
-            self._agent_tool.clear()
-            self._render()
-            self._lines_on_screen = 0  # permanent — report streams below
-            print(file=sys.stderr, flush=True)  # blank line before report
-
-    def finish(self) -> None:
-        """No-op — display was finalized in start_report()."""
-        pass
-
-    # -- agent lifecycle ------------------------------------------------------
-
-    def recon_tool(self, tool_name: str, summary: str) -> None:
-        """Update the recon line with current tool activity."""
-        with self._lock:
-            if tool_name:
-                self._recon_tool_info = f"{tool_name}({summary})"
-                self._recon_thinking_since = 0.0
-            else:
-                self._recon_tool_info = "Thinking…"
-                self._recon_thinking_since = _time.monotonic()
-            self._debounced_render()
-
-    def recon_text(self, text: str) -> None:
-        """Print recon reasoning above the display, then redraw."""
-        with self._lock:
-            self._clear_lines()
-            _print_text_block(text)
-            self._recon_tool_info = ""
-            self._recon_thinking_since = 0.0
-            lines = self._build_lines()
-            for line in lines:
-                print(line, file=sys.stderr, flush=True)
-            self._lines_on_screen = len(lines)
-
-    def recon_todos(self, todos: list[dict]) -> None:
-        """Update the recon plan checklist."""
-        with self._lock:
-            self._recon_todos = todos
-            self._debounced_render()
-
-    def show_recon_summary(self, summary: str) -> None:
-        """Print the final recon summary permanently above the display."""
-        if not summary.strip():
-            return
-        with self._lock:
-            self._clear_lines()
-            self._lines_on_screen = 0
-        _print_text_block(summary)
-
-    def agent_started(self, name: str) -> None:
-        with self._lock:
-            self._agent_status[name] = "running"
-            self._debounced_render()
-
-    def agent_tool(self, name: str, tool_name: str, summary: str, is_subagent: bool = False) -> None:
-        with self._lock:
-            self._agent_status[name] = "running"
-            if is_subagent:
-                # Sub-agent tool — show below parent line
-                if tool_name:
-                    self._agent_subtool[name] = f"{tool_name}({summary})"
-                else:
-                    self._agent_subtool[name] = "Thinking…"
-                    self._agent_thinking_since[name] = _time.monotonic()
-                if name not in self._agent_subagent_since:
-                    self._agent_subagent_since[name] = _time.monotonic()
-            else:
-                # Parent tool — update main line, clear sub-agent state
-                if tool_name == "Task":
-                    # Spawning a sub-agent — keep sub state, record type
-                    self._agent_subname[name] = "explore"
-                else:
-                    self._agent_subtool.pop(name, None)
-                    self._agent_subname.pop(name, None)
-                    self._agent_subagent_since.pop(name, None)
-                if tool_name:
-                    self._agent_tool[name] = f"{tool_name}({summary})"
-                    self._agent_thinking_since.pop(name, None)
-                else:
-                    self._agent_tool[name] = "Thinking…"
-                    self._agent_thinking_since[name] = _time.monotonic()
-            self._debounced_render()
-
-    def agent_todos(self, name: str, todos: list[dict]) -> None:
-        """Update the todo checklist for an agent."""
-        with self._lock:
-            self._agent_todos[name] = todos
-            self._debounced_render()
-
-    def agent_completed(self, name: str) -> None:
-        with self._lock:
-            self._agent_status[name] = "completed"
-            self._agent_tool.pop(name, None)
-            self._agent_subtool.pop(name, None)
-            self._agent_subname.pop(name, None)
-            self._agent_thinking_since.pop(name, None)
-            self._agent_subagent_since.pop(name, None)
-            self._agent_todos.pop(name, None)
-            self._debounced_render()
-
-    # -- rendering ------------------------------------------------------------
-
-    def _debounced_render(self) -> None:
-        """Render at most every _DEBOUNCE_MS milliseconds."""
-        now = _time.monotonic() * 1000
-        if now - self._last_render < _DEBOUNCE_MS:
-            return
-        self._render()
-
-    def _clear_lines(self) -> None:
-        for _ in range(self._lines_on_screen):
-            print(f"{_UP}{_CLEAR_LINE}", end="", file=sys.stderr, flush=True)
-
-    def _build_lines(self) -> list[str]:
-        lines: list[str] = []
-
-        # Phase 1: Reconnaissance
-        if self._phase == 1:
-            if self._recon_tool_info:
-                info = self._recon_tool_info
-                if self._recon_thinking_since:
-                    elapsed = int(_time.monotonic() - self._recon_thinking_since)
-                    mins, secs = divmod(elapsed, 60)
-                    time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-                    info = f"{info} ({time_str})"
-                width = _get_terminal_width()
-                info = _truncate(info, width - 22)
-                lines.append(
-                    f"  {_CYAN}◆{_RESET} Reconnaissance"
-                    f"  {_DIM}{info}{_RESET}"
-                )
-            else:
-                lines.append(f"  {_CYAN}◆{_RESET} Reconnaissance")
-            # Recon plan checklist
-            if self._recon_todos:
-                width = _get_terminal_width()
-                for todo in self._recon_todos:
-                    s = todo.get("status", "pending")
-                    sym = f"{_GREEN}✓{_RESET}" if s == "completed" else (f"{_CYAN}◆{_RESET}" if s == "in_progress" else f"{_DIM}○{_RESET}")
-                    content = _truncate(todo.get("content", ""), width - 10)
-                    lines.append(f"      {sym} {_DIM}{content}{_RESET}")
-        else:
-            lines.append(f"  {_GREEN}✓{_RESET} {_DIM}Reconnaissance{_RESET}")
-
-        lines.append("")
-
-        # Phase 2: Investigations
-        if self._phase < 2:
-            lines.append(f"  {_DIM}○ Investigations{_RESET}")
-        elif self._phase == 2:
-            done = sum(1 for s in self._agent_status.values() if s == "completed")
-            total = len(self._skill_names)
-            elapsed = _time.monotonic() - self._investigations_start
-            mins, secs = divmod(int(elapsed), 60)
-            time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-            lines.append(
-                f"  {_CYAN}◆{_RESET} Investigations"
-                f"  {_DIM}({done}/{total} · {time_str}){_RESET}"
-            )
-        else:
-            lines.append(f"  {_GREEN}✓{_RESET} {_DIM}Investigations{_RESET}")
-
-        # Per-agent status lines (during phase 2+)
-        if self._phase >= 2:
-            width = _get_terminal_width()
-            for name in self._skill_names:
-                status = self._agent_status.get(name, "pending")
-                if status == "completed":
-                    lines.append(
-                        f"    {_GREEN}✓{_RESET} {_DIM}{name}{_RESET}"
-                    )
-                elif status == "running":
-                    tool_info = self._agent_tool.get(name, "")
-                    if tool_info:
-                        thinking_since = self._agent_thinking_since.get(name)
-                        # Only show thinking timer on parent line if no sub-agent
-                        if thinking_since and name not in self._agent_subagent_since:
-                            elapsed = int(_time.monotonic() - thinking_since)
-                            mins, secs = divmod(elapsed, 60)
-                            time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-                            tool_info = f"{tool_info} ({time_str})"
-                        tool_info = _truncate(tool_info, width - len(name) - 10)
-                        lines.append(
-                            f"    {_CYAN}◆{_RESET} {name}"
-                            f"  {_DIM}{tool_info}{_RESET}"
-                        )
-                    else:
-                        lines.append(f"    {_CYAN}◆{_RESET} {name}")
-                    # Sub-agent child line
-                    subtool = self._agent_subtool.get(name, "")
-                    if subtool:
-                        subname = self._agent_subname.get(name, "")
-                        sub_since = self._agent_subagent_since.get(name)
-                        if sub_since:
-                            elapsed = int(_time.monotonic() - sub_since)
-                            mins, secs = divmod(elapsed, 60)
-                            time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-                            subtool = f"{subtool} ({time_str})"
-                        subtool = _truncate(subtool, width - len(subname) - 14)
-                        if subname:
-                            lines.append(
-                                f"      {_DIM}⎿{_RESET} {_CYAN}{subname}{_RESET}"
-                                f"  {_DIM}{subtool}{_RESET}"
-                            )
-                        else:
-                            lines.append(
-                                f"      {_DIM}⎿{_RESET} {_DIM}{subtool}{_RESET}"
-                            )
-                    # Todo items (capped to _MAX_TODO_LINES)
-                    todos = self._agent_todos.get(name, [])
-                    if todos:
-                        shown = 0
-                        for todo in todos:
-                            if shown >= _MAX_TODO_LINES:
-                                remaining = len(todos) - shown
-                                lines.append(f"        {_DIM}… +{remaining} more{_RESET}")
-                                break
-                            s = todo.get("status", "pending")
-                            sym = f"{_GREEN}✓{_RESET}" if s == "completed" else (f"{_CYAN}◆{_RESET}" if s == "in_progress" else f"{_DIM}○{_RESET}")
-                            content = _truncate(todo.get("content", ""), width - 12)
-                            lines.append(f"        {sym} {_DIM}{content}{_RESET}")
-                            shown += 1
-                else:
-                    lines.append(f"    {_DIM}○ {name}{_RESET}")
-
-        lines.append("")
-
-        # Phase 3: Report
-        if self._phase < 3:
-            lines.append(f"  {_DIM}○ Report{_RESET}")
-        elif self._phase == 3:
-            lines.append(f"  {_CYAN}◆{_RESET} Report")
-        else:
-            lines.append(f"  {_GREEN}✓{_RESET} {_DIM}Report{_RESET}")
-
-        # Cap to terminal height to prevent scroll-off rendering bugs.
-        # When the display exceeds the terminal, _UP escape codes can't
-        # reach lines that scrolled off, causing stacking artifacts.
-        max_height = _get_terminal_height() - 2
-        if len(lines) > max_height:
-            footer = lines[-2:]  # blank + Report line
-            body = lines[: max_height - len(footer) - 1]
-            lines = body + [f"    {_DIM}…{_RESET}"] + footer
-
-        return lines
-
-    def _render(self) -> None:
-        self._clear_lines()
-        lines = self._build_lines()
-        for line in lines:
-            print(line, file=sys.stderr, flush=True)
-        self._lines_on_screen = len(lines)
-        self._last_render = _time.monotonic() * 1000
+# Scan display lives in a dedicated module for readability.
+from hiro_agent.scan_display import _ScanDisplay

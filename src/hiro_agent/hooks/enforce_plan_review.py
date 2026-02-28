@@ -12,12 +12,27 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-STATE_DIR = Path(".hiro/.state")
+
+def _git_root() -> Path:
+    """Resolve the git repo root so paths work from any CWD."""
+    try:
+        root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return Path(root)
+    except Exception:
+        return Path(".")
+
+
+STATE_DIR = _git_root() / ".hiro" / ".state"
 
 
 def _state_path(session_id: str) -> Path:
@@ -67,8 +82,7 @@ def _is_plan_review(tool_name: str, tool_input: dict[str, Any]) -> bool:
         return True
     if tool_name == "Bash":
         cmd = tool_input.get("command", "")
-        # Match both old (hiro_review.review_plan) and new (hiro review-plan) forms
-        if "hiro_review.review_plan" in cmd or "hiro review-plan" in cmd:
+        if "hiro review-plan" in cmd or "hiro_review.review_plan" in cmd:
             return True
     return False
 
@@ -109,9 +123,14 @@ def main() -> int:
                 return 0
 
             _deny_pre_tool(
-                "Plan finalization blocked: run "
-                "`cat <plan_file> | hiro review-plan` "
-                "and incorporate findings before exiting plan mode."
+                "Plan finalization blocked — Hiro security review required.\n\n"
+                "Run this exact Bash command:\n"
+                "  hiro review-plan --file /path/to/plan.md --output .hiro/.state/plan-review.md\n\n"
+                "Replace /path/to/plan.md with the plan file you wrote. "
+                "Do NOT use cat or pipes. Do NOT run in background.\n"
+                "After the command exits (code 0), use the Read tool on "
+                ".hiro/.state/plan-review.md to read the report.\n\n"
+                "Then call ExitPlanMode again — it will be allowed."
             )
             return 0
 

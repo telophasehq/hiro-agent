@@ -10,7 +10,7 @@ from hiro_agent.prompts import INFRA_REVIEW_SYSTEM_PROMPT
 
 logger = structlog.get_logger(__name__)
 
-ALLOWED_TOOLS = ["Read", "Glob"]
+ALLOWED_TOOLS = ["Read", "Grep"]
 MAX_TURNS = 12
 
 # Detect config type from filename extension/patterns

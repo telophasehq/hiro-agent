@@ -1,8 +1,8 @@
-"""Code review — multi-agent security audit of a diff."""
+"""Code review — single-agent security audit of a diff."""
 
 import asyncio
+import json
 import os
-import shutil
 import sys
 import time as _time
 from pathlib import Path
@@ -10,25 +10,42 @@ from pathlib import Path
 import structlog
 
 from hiro_agent._common import (
-    McpSetup,
-    SKILL_TOOLS,
+    ToolPolicyViolationError,
     _ScanDisplay,
+    _get_api_key,
+    _prefetch_review_context,
+    get_tool_policy_violation,
     _run_report_stream,
-    _run_skill_waves,
     _run_tracked_agent,
     prepare_mcp,
 )
 from hiro_agent.prompts import (
     CONTEXT_PREAMBLE,
+    DIFF_INVESTIGATION_SYSTEM_PROMPT,
     DIFF_RECON_SYSTEM_PROMPT,
     REPORT_SYSTEM_PROMPT,
-    SKILL_AGENT_SYSTEM_PROMPT,
 )
 from hiro_agent.skills import SKILL_NAMES, load_skill
 
 logger = structlog.get_logger(__name__)
 
-RECON_TOOLS = ["Read", "Grep", "Glob", "TodoWrite", "TodoRead"]
+RECON_TOOLS = ["Read", "Grep", "TodoWrite", "TodoRead"]
+
+
+def _clear_review_state(cwd: str | None) -> None:
+    """Clear all code_review state files so git commit is unblocked."""
+    state_dir = Path(cwd or ".") / ".hiro" / ".state"
+    if not state_dir.is_dir():
+        return
+    for state_file in state_dir.glob("code_review_*.json"):
+        try:
+            state = json.loads(state_file.read_text())
+            state["needs_review"] = False
+            state["modified_files"] = []
+            state["updated_at"] = int(_time.time())
+            state_file.write_text(json.dumps(state))
+        except Exception:
+            continue
 
 
 async def review_code(
@@ -37,14 +54,14 @@ async def review_code(
     cwd: str | None = None,
     context: str = "",
     verbose: bool = False,
+    output_file: str | None = None,
 ) -> None:
-    """Run a multi-agent security review of a diff.
+    """Run a single-agent security review of a diff.
 
-    Four phases (same architecture as scan, scoped to a diff):
-      1. Reconnaissance — understand the code around the diff
-      2. Compact — compress recon into a concise brief
-      3. Skill agents — parallel investigations, one per skill
-      4. Report — synthesize findings into a structured report
+    Three phases:
+      1. Reconnaissance — explore code surrounding the diff (Sonnet, 5 turns)
+      2. Investigation — single Opus agent with all playbook knowledge (10 turns)
+      3. Report — synthesize findings into a structured report
 
     Args:
         diff: Git diff output to review.
@@ -61,8 +78,12 @@ async def review_code(
     # Shared MCP setup — called once, reused by all agents
     mcp_setup = await prepare_mcp(is_tty=is_tty)
 
-    display = _ScanDisplay(SKILL_NAMES) if is_tty else None
-    scratchpad_dir = Path(cwd or ".") / ".hiro" / ".scratchpad"
+    # Prefetch infrastructure context for this diff (runs in parallel with setup)
+    api_key = _get_api_key()
+    if api_key and mcp_setup.mcp_config:
+        mcp_setup.review_context = await _prefetch_review_context(api_key, diff)
+
+    display = _ScanDisplay(["investigation"]) if is_tty else None
 
     try:
         # -- Phase 1: Reconnaissance ------------------------------------------
@@ -85,135 +106,116 @@ async def review_code(
             if display:
                 display.recon_text(text)
 
+        def _on_recon_tool_event(agent_name: str, tool_name: str, tool_input: dict, is_subagent: bool) -> None:
+            violation = get_tool_policy_violation(
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+            if violation is not None:
+                blocked_path, reason = violation
+                raise ToolPolicyViolationError(blocked_path, reason, tool_name=tool_name)
+
         t0 = _time.monotonic()
-        recon, _ = await _run_tracked_agent(
-            name="recon",
-            prompt="\n".join(recon_prompt_parts),
-            system_prompt=DIFF_RECON_SYSTEM_PROMPT,
-            cwd=cwd,
-            allowed_tools=RECON_TOOLS,
-            mcp_setup=mcp_setup,
-            max_turns=15,
-            model="opus",
-            on_tool=_on_recon_tool,
-            on_text=_on_recon_text,
-        )
+        recon = ""
+        recon_prompt = "\n".join(recon_prompt_parts)
+        recon_policy_note = ""
+        for attempt in range(3):
+            try:
+                recon_max_turns = 5
+                recon, _ = await _run_tracked_agent(
+                    name="recon",
+                    prompt=f"{recon_prompt}{recon_policy_note}",
+                    system_prompt=DIFF_RECON_SYSTEM_PROMPT.replace("{max_turns}", str(recon_max_turns)),
+                    cwd=cwd,
+                    allowed_tools=RECON_TOOLS,
+                    mcp_setup=mcp_setup,
+                    max_turns=recon_max_turns,
+                    model="sonnet",
+                    effort="medium",
+                    on_tool=_on_recon_tool,
+                    on_tool_event=_on_recon_tool_event,
+                    on_text=_on_recon_text,
+                )
+                break
+            except ToolPolicyViolationError as exc:
+                logger.warning(
+                    "diff_recon_policy_violation",
+                    attempt=attempt + 1,
+                    tool=exc.tool_name,
+                    path=exc.path,
+                    reason=exc.reason,
+                )
+                if attempt == 2:
+                    raise
+                recon_policy_note = (
+                    "\n\n## Enforced Tool Policy\n"
+                    "- Do not search `.venv`, `node_modules`, `vendor`, `dist`, or other ignored directories.\n"
+                    "- For `Grep`/`Glob`, always scope to first-party paths (for example: `src`, `app`, "
+                    "`backend`, `frontend`, `services`, `tests`).\n"
+                    "- Repo-root recursive searches are blocked.\n"
+                )
         logger.info("phase_completed", phase="recon", duration_s=round(_time.monotonic() - t0, 1))
 
-        # Always show the recon summary (the "scan plan")
-        if display:
-            display.show_recon_summary(recon)
-
-        # -- Phase 1b: Compact recon summary -----------------------------------
-        t0 = _time.monotonic()
-        compact_mcp = McpSetup(mcp_config={})
-        recon_brief, _ = await _run_tracked_agent(
-            name="compact",
-            prompt=(
-                "Compress the following reconnaissance summary into a concise "
-                "brief (under 2000 words). Preserve ALL factual findings: tech "
-                "stack, key file paths, entry points, auth mechanism, dependencies, "
-                "infrastructure, and security-relevant observations. Drop verbose "
-                "descriptions, redundant details, and filler. Output only the "
-                "compressed summary — no preamble.\n\n"
-                f"{recon}"
-            ),
-            system_prompt="You are a concise technical summarizer. Output only the compressed summary.",
-            cwd=cwd,
-            allowed_tools=[],
-            mcp_setup=compact_mcp,
-            max_turns=1,
-            model="sonnet",
-        )
-        logger.info("phase_completed", phase="compact", duration_s=round(_time.monotonic() - t0, 1))
-
-        # -- Phase 2: Skill agents (parallel, multi-wave) ----------------------
+        # -- Phase 2: Investigation (single agent, bundled playbooks) ----------
         if display:
             display.start_investigations()
+            display.agent_started("investigation")
 
-        t_investigations = _time.monotonic()
-        scratchpad_dir.mkdir(parents=True, exist_ok=True)
+        t0 = _time.monotonic()
 
-        async def _run_skill(name: str) -> tuple[str, str]:
-            t_skill = _time.monotonic()
-
-            if display:
-                display.agent_started(name)
-
-            skill_content = load_skill(name)
-            scratchpad_path = scratchpad_dir / f"{name}.md"
-            system = SKILL_AGENT_SYSTEM_PROMPT.format(
-                context_preamble=CONTEXT_PREAMBLE,
-                skill_content=skill_content,
-                scratchpad_path=str(scratchpad_path.resolve()),
-            )
-
-            skill_prompt_parts = [
-                f"## Diff Under Review\n\n```diff\n{diff}\n```",
-                f"\n## Reconnaissance Summary\n\n{recon_brief}",
-                f"\nInvestigate **{name}** security issues in this diff and the surrounding code.",
-                "Focus on the changes in the diff, but trace data flow into and out of the changed code.",
-            ]
-            if context:
-                skill_prompt_parts.append(f"\nAdditional context: {context}")
-
-            def _on_tool(agent_name: str, tool_name: str, summary: str, is_subagent: bool) -> None:
-                if display:
-                    display.agent_tool(agent_name, tool_name, summary, is_subagent)
-
-            def _on_todos(agent_name: str, todos: list[dict]) -> None:
-                if display:
-                    display.agent_todos(agent_name, todos)
-
-            result, tool_call_count = await _run_skill_waves(
-                name=name,
-                system_prompt=system,
-                skill_prompt="\n".join(skill_prompt_parts),
-                scratchpad_path=scratchpad_path,
-                cwd=cwd,
-                mcp_setup=mcp_setup,
-                on_tool=_on_tool,
-                on_todos=_on_todos,
-            )
-
-            if display:
-                display.agent_completed(name)
-
-            if tool_call_count < 3:
-                status = f"INCOMPLETE — only {tool_call_count} tool calls"
-            else:
-                status = f"{tool_call_count} tool calls"
-
-            total_duration = round(_time.monotonic() - t_skill, 1)
-            logger.info(
-                "skill_completed",
-                skill=name,
-                tool_calls=tool_call_count,
-                total_s=total_duration,
-                findings_len=len(result),
-            )
-
-            return name, f"_Investigation status: {status}_\n\n{result}"
-
-        raw_results = await asyncio.gather(
-            *[_run_skill(n) for n in SKILL_NAMES],
-            return_exceptions=True,
+        # Bundle all playbooks into the system prompt
+        all_playbooks = "\n\n".join(
+            f"### {name.replace('-', ' ').title()}\n\n{load_skill(name)}"
+            for name in SKILL_NAMES
         )
 
-        # Collect results, logging any exceptions
-        findings: list[tuple[str, str]] = []
-        for r in raw_results:
-            if isinstance(r, BaseException):
-                logger.error("skill_agent_failed", error=str(r))
-            else:
-                findings.append(r)
+        investigation_max_turns = 10
+        investigation_system = DIFF_INVESTIGATION_SYSTEM_PROMPT.format(
+            context_preamble=CONTEXT_PREAMBLE,
+            all_playbooks=all_playbooks,
+            max_turns=investigation_max_turns,
+        )
+
+        investigation_prompt_parts = [
+            f"## Diff Under Review\n\n```diff\n{diff}\n```",
+            f"\n## Codebase Context\n\n{recon}",
+        ]
+        if context:
+            investigation_prompt_parts.append(f"\nAdditional context: {context}")
+
+        def _on_investigation_tool(agent_name: str, tool_name: str, summary: str, is_subagent: bool) -> None:
+            if display:
+                display.agent_tool(agent_name, tool_name, summary, is_subagent)
+
+        def _on_investigation_tool_event(agent_name: str, tool_name: str, tool_input: dict, is_subagent: bool) -> None:
+            violation = get_tool_policy_violation(
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+            if violation is not None:
+                blocked_path, reason = violation
+                raise ToolPolicyViolationError(blocked_path, reason, tool_name=tool_name)
+
+        investigation_output, _ = await _run_tracked_agent(
+            name="investigation",
+            prompt="\n".join(investigation_prompt_parts),
+            system_prompt=investigation_system,
+            cwd=cwd,
+            allowed_tools=["Read", "Grep"],
+            mcp_setup=mcp_setup,
+            max_turns=investigation_max_turns,
+            model="opus",
+            on_tool=_on_investigation_tool,
+            on_tool_event=_on_investigation_tool_event,
+        )
+
+        if display:
+            display.agent_completed("investigation")
 
         logger.info(
             "phase_completed",
-            phase="investigations",
-            duration_s=round(_time.monotonic() - t_investigations, 1),
-            succeeded=len(findings),
-            failed=len(raw_results) - len(findings),
+            phase="investigation",
+            duration_s=round(_time.monotonic() - t0, 1),
         )
 
         # -- Phase 3: Report (streaming) --------------------------------------
@@ -221,11 +223,9 @@ async def review_code(
             display.start_report()
 
         t0 = _time.monotonic()
-        combined = "\n\n".join(f"## {name}\n\n{text}" for name, text in findings)
         report_prompt = (
             f"## Diff Under Review\n\n```diff\n{diff}\n```\n\n"
-            f"## Reconnaissance Summary\n\n{recon}\n\n"
-            f"## Investigation Findings\n\n{combined}\n\n"
+            f"## Investigation Findings\n\n{investigation_output}\n\n"
             "Synthesize the above into a final security report for this diff."
         )
 
@@ -235,6 +235,7 @@ async def review_code(
             mcp_setup=mcp_setup,
             model="opus",
             is_tty=is_tty,
+            output_file=output_file,
         )
         logger.info("phase_completed", phase="report", duration_s=round(_time.monotonic() - t0, 1))
 
@@ -246,8 +247,11 @@ async def review_code(
             total_s=round(_time.monotonic() - review_start, 1),
         )
 
+        # Clear pre-commit gate so `git commit` is unblocked.
+        _clear_review_state(cwd)
+
     finally:
-        shutil.rmtree(scratchpad_dir, ignore_errors=True)
+        pass
 
 
 def main() -> None:

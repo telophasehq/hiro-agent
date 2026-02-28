@@ -1,21 +1,16 @@
-"""Tests for hiro_agent.review_code — multi-agent diff security review."""
+"""Tests for hiro_agent.review_code — single-agent diff security review."""
 
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from hiro_agent._common import McpSetup, SKILL_TOOLS
+from hiro_agent._common import McpSetup, ToolPolicyViolationError
 from hiro_agent.review_code import review_code
 from hiro_agent.skills import SKILL_NAMES
 
 
-def _is_meta_agent(name: str) -> bool:
-    """Return True for recon/compact (non-skill agents)."""
-    return name in ("recon", "compact")
-
-
 class TestReviewCode:
-    """Test multi-agent review_code() flow."""
+    """Test single-agent review_code() flow."""
 
     @pytest.fixture
     def mock_mcp_setup(self):
@@ -26,46 +21,17 @@ class TestReviewCode:
         return str(tmp_path)
 
     @pytest.mark.asyncio
-    async def test_all_skills_spawned(self, mock_mcp_setup, tmp_cwd):
-        """All skill agents should be invoked during investigation phase."""
-        tracked_names = []
-
-        async def mock_tracked(*, name, **kwargs):
-            tracked_names.append(name)
-            return ("recon summary", "sess-recon")
-
-        skill_names_called = []
-
-        async def mock_skill_waves(*, name, **kwargs):
-            skill_names_called.append(name)
-            return (f"findings for {name}", 5)
-
-        with (
-            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
-            patch("hiro_agent.review_code._run_report_stream", return_value=None),
-        ):
-            await review_code("diff --git a/foo.py\n+import os", cwd=tmp_cwd)
-
-        assert sorted(skill_names_called) == sorted(SKILL_NAMES)
-
-    @pytest.mark.asyncio
     async def test_diff_passed_to_recon(self, mock_mcp_setup, tmp_cwd):
         """Diff should appear in the recon agent prompt."""
         captured_prompts = {}
 
         async def mock_tracked(*, name, prompt, **kwargs):
             captured_prompts[name] = prompt
-            return ("recon", "sess")
-
-        async def mock_skill_waves(*, name, **kwargs):
-            return ("ok", 5)
+            return ("recon output", "sess")
 
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
             patch("hiro_agent.review_code._run_report_stream", return_value=None),
         ):
             await review_code("diff --git SECRET_DIFF", cwd=tmp_cwd)
@@ -73,92 +39,71 @@ class TestReviewCode:
         assert "SECRET_DIFF" in captured_prompts["recon"]
 
     @pytest.mark.asyncio
-    async def test_diff_passed_to_skill_agents(self, mock_mcp_setup, tmp_cwd):
-        """Diff should appear in each skill agent's prompt."""
+    async def test_diff_passed_to_investigation(self, mock_mcp_setup, tmp_cwd):
+        """Diff should appear in the investigation agent prompt."""
         captured_prompts = {}
 
         async def mock_tracked(*, name, prompt, **kwargs):
-            return ("recon", "sess")
-
-        async def mock_skill_waves(*, name, skill_prompt, **kwargs):
-            captured_prompts[name] = skill_prompt
-            return ("ok", 5)
+            captured_prompts[name] = prompt
+            return ("output", "sess")
 
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
             patch("hiro_agent.review_code._run_report_stream", return_value=None),
         ):
             await review_code("diff --git UNIQUE_DIFF_TOKEN", cwd=tmp_cwd)
 
-        for name in SKILL_NAMES:
-            assert "UNIQUE_DIFF_TOKEN" in captured_prompts[name]
+        assert "UNIQUE_DIFF_TOKEN" in captured_prompts["investigation"]
 
     @pytest.mark.asyncio
-    async def test_recon_output_passed_to_skills(self, mock_mcp_setup, tmp_cwd):
-        """Compacted recon summary should appear in investigation agent prompts."""
+    async def test_recon_passed_to_investigation(self, mock_mcp_setup, tmp_cwd):
+        """Recon output should appear in the investigation agent prompt."""
         captured_prompts = {}
 
         async def mock_tracked(*, name, prompt, **kwargs):
+            captured_prompts[name] = prompt
             if name == "recon":
                 return ("RECON_DATA_XYZ", "sess-recon")
-            if name == "compact":
-                return ("COMPACT_RECON", "sess-compact")
-            return ("ok", "sess")
-
-        async def mock_skill_waves(*, name, skill_prompt, **kwargs):
-            captured_prompts[name] = skill_prompt
-            return ("ok", 5)
+            return ("output", "sess")
 
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
             patch("hiro_agent.review_code._run_report_stream", return_value=None),
         ):
             await review_code("some diff", cwd=tmp_cwd)
 
-        for name in SKILL_NAMES:
-            assert "COMPACT_RECON" in captured_prompts[name]
+        assert "RECON_DATA_XYZ" in captured_prompts["investigation"]
 
     @pytest.mark.asyncio
     async def test_context_passed_through(self, mock_mcp_setup, tmp_cwd):
-        """Context string should appear in recon and skill agent prompts."""
-        captured_recon_prompt = {}
-        captured_skill_prompts = {}
+        """Context string should appear in recon and investigation prompts."""
+        captured_prompts = {}
 
         async def mock_tracked(*, name, prompt, **kwargs):
-            if name == "recon":
-                captured_recon_prompt["prompt"] = prompt
-            return ("recon", "sess")
-
-        async def mock_skill_waves(*, name, skill_prompt, **kwargs):
-            captured_skill_prompts[name] = skill_prompt
-            return ("ok", 5)
+            captured_prompts[name] = prompt
+            return ("output", "sess")
 
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
             patch("hiro_agent.review_code._run_report_stream", return_value=None),
         ):
             await review_code("diff", cwd=tmp_cwd, context="This is an auth module")
 
-        assert "This is an auth module" in captured_recon_prompt["prompt"]
-        for name in SKILL_NAMES:
-            assert "This is an auth module" in captured_skill_prompts[name]
+        assert "This is an auth module" in captured_prompts["recon"]
+        assert "This is an auth module" in captured_prompts["investigation"]
 
     @pytest.mark.asyncio
-    async def test_report_gets_skill_findings(self, mock_mcp_setup, tmp_cwd):
-        """Report phase should receive synthesized findings from skill waves."""
+    async def test_report_gets_investigation_output(self, mock_mcp_setup, tmp_cwd):
+        """Report phase should receive investigation output."""
         captured_report = {}
 
         async def mock_tracked(*, name, **kwargs):
-            return ("recon", "sess-recon")
-
-        async def mock_skill_waves(*, name, **kwargs):
-            return (f"FINDINGS_{name.upper()}", 5)
+            if name == "investigation":
+                return ("INVESTIGATION_FINDINGS_HERE", "sess")
+            return ("recon", "sess")
 
         async def mock_report(*, prompt, **kwargs):
             captured_report["prompt"] = prompt
@@ -166,14 +111,11 @@ class TestReviewCode:
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
             patch("hiro_agent.review_code._run_report_stream", side_effect=mock_report),
         ):
             await review_code("diff", cwd=tmp_cwd)
 
-        prompt = captured_report["prompt"]
-        for name in SKILL_NAMES:
-            assert f"FINDINGS_{name.upper()}" in prompt
+        assert "INVESTIGATION_FINDINGS_HERE" in captured_report["prompt"]
 
     @pytest.mark.asyncio
     async def test_report_includes_diff(self, mock_mcp_setup, tmp_cwd):
@@ -181,10 +123,7 @@ class TestReviewCode:
         captured_report = {}
 
         async def mock_tracked(*, name, **kwargs):
-            return ("recon", "sess")
-
-        async def mock_skill_waves(*, name, **kwargs):
-            return ("ok", 5)
+            return ("output", "sess")
 
         async def mock_report(*, prompt, **kwargs):
             captured_report["prompt"] = prompt
@@ -192,7 +131,6 @@ class TestReviewCode:
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
             patch("hiro_agent.review_code._run_report_stream", side_effect=mock_report),
         ):
             await review_code("REPORT_DIFF_MARKER", cwd=tmp_cwd)
@@ -200,45 +138,16 @@ class TestReviewCode:
         assert "REPORT_DIFF_MARKER" in captured_report["prompt"]
 
     @pytest.mark.asyncio
-    async def test_one_agent_failure_doesnt_crash(self, mock_mcp_setup, tmp_cwd):
-        """A single skill agent failure should not crash the review."""
-        skill_count = 0
-
-        async def mock_tracked(*, name, **kwargs):
-            return ("recon", "sess-recon")
-
-        async def mock_skill_waves(*, name, **kwargs):
-            nonlocal skill_count
-            skill_count += 1
-            if name == "crypto":
-                raise RuntimeError("crypto agent exploded")
-            return (f"findings for {name}", 5)
-
-        with (
-            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
-            patch("hiro_agent.review_code._run_report_stream", return_value=None),
-        ):
-            await review_code("diff", cwd=tmp_cwd)  # Should not raise
-
-        assert skill_count == len(SKILL_NAMES)
-
-    @pytest.mark.asyncio
     async def test_mcp_called_once(self, mock_mcp_setup, tmp_cwd):
         """prepare_mcp should be called exactly once."""
         mock_prepare = AsyncMock(return_value=mock_mcp_setup)
 
         async def mock_tracked(*, name, **kwargs):
-            return ("recon", "sess")
-
-        async def mock_skill_waves(*, name, **kwargs):
-            return ("ok", 5)
+            return ("output", "sess")
 
         with (
             patch("hiro_agent.review_code.prepare_mcp", mock_prepare),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
             patch("hiro_agent.review_code._run_report_stream", return_value=None),
         ):
             await review_code("diff", cwd=tmp_cwd)
@@ -247,54 +156,202 @@ class TestReviewCode:
 
     @pytest.mark.asyncio
     async def test_recon_uses_diff_prompt(self, mock_mcp_setup, tmp_cwd):
-        """Recon should use DIFF_RECON_SYSTEM_PROMPT, not RECON_SYSTEM_PROMPT."""
+        """Recon should use DIFF_RECON_SYSTEM_PROMPT, not PLAN_RECON_SYSTEM_PROMPT."""
         captured_recon = {}
 
         async def mock_tracked(*, name, system_prompt, **kwargs):
             if name == "recon":
                 captured_recon["system_prompt"] = system_prompt
-            return ("recon", "sess")
-
-        async def mock_skill_waves(*, name, **kwargs):
-            return ("ok", 5)
+            return ("output", "sess")
 
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
             patch("hiro_agent.review_code._run_report_stream", return_value=None),
         ):
             await review_code("diff", cwd=tmp_cwd)
 
-        # DIFF_RECON_SYSTEM_PROMPT has unique markers
         assert "Callers and consumers" in captured_recon["system_prompt"]
         assert "Diff Overview" in captured_recon["system_prompt"]
 
     @pytest.mark.asyncio
-    async def test_on_todos_passed_to_skill_waves(self, mock_mcp_setup, tmp_cwd):
-        """on_todos kwarg should be accepted by _run_skill_waves mock."""
-        captured_kwargs = {}
+    async def test_recon_model_is_sonnet(self, mock_mcp_setup, tmp_cwd):
+        """Recon phase should use sonnet model."""
+        captured = {}
 
-        async def mock_tracked(*, name, **kwargs):
-            return ("recon", "sess-recon")
-
-        async def mock_skill_waves(*, name, on_todos=None, **kwargs):
-            captured_kwargs[name] = {"on_todos": on_todos}
-            return ("ok", 5)
+        async def mock_tracked(*, name, model, **kwargs):
+            if name == "recon":
+                captured["model"] = model
+            return ("output", "sess")
 
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_code._run_skill_waves", side_effect=mock_skill_waves),
+            patch("hiro_agent.review_code._run_report_stream", return_value=None),
+        ):
+            await review_code("diff", cwd=tmp_cwd)
+
+        assert captured["model"] == "sonnet"
+
+    @pytest.mark.asyncio
+    async def test_investigation_model_is_opus(self, mock_mcp_setup, tmp_cwd):
+        """Investigation phase should use opus model."""
+        captured = {}
+
+        async def mock_tracked(*, name, model, **kwargs):
+            if name == "investigation":
+                captured["model"] = model
+            return ("output", "sess")
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
+            patch("hiro_agent.review_code._run_report_stream", return_value=None),
+        ):
+            await review_code("diff", cwd=tmp_cwd)
+
+        assert captured["model"] == "opus"
+
+    @pytest.mark.asyncio
+    async def test_investigation_has_read_grep(self, mock_mcp_setup, tmp_cwd):
+        """Investigation agent should have Read and Grep tools."""
+        captured = {}
+
+        async def mock_tracked(*, name, allowed_tools=None, **kwargs):
+            if name == "investigation":
+                captured["allowed_tools"] = allowed_tools
+            return ("output", "sess")
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
+            patch("hiro_agent.review_code._run_report_stream", return_value=None),
+        ):
+            await review_code("diff", cwd=tmp_cwd)
+
+        assert "Read" in captured["allowed_tools"]
+        assert "Grep" in captured["allowed_tools"]
+
+    @pytest.mark.asyncio
+    async def test_investigation_system_prompt_has_playbooks(self, mock_mcp_setup, tmp_cwd):
+        """Investigation system prompt should include content from all skill playbooks."""
+        captured = {}
+
+        async def mock_tracked(*, name, system_prompt=None, **kwargs):
+            if name == "investigation":
+                captured["system_prompt"] = system_prompt
+            return ("output", "sess")
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
+            patch("hiro_agent.review_code._run_report_stream", return_value=None),
+        ):
+            await review_code("diff", cwd=tmp_cwd)
+
+        system = captured["system_prompt"]
+        for skill_name in SKILL_NAMES:
+            title = skill_name.replace("-", " ").title()
+            assert title in system, f"Missing playbook section for {skill_name}"
+
+    @pytest.mark.asyncio
+    async def test_investigation_max_turns_is_10(self, mock_mcp_setup, tmp_cwd):
+        """Investigation agent should have 10 turns."""
+        captured = {}
+
+        async def mock_tracked(*, name, max_turns=None, system_prompt=None, **kwargs):
+            if name == "investigation":
+                captured["max_turns"] = max_turns
+                captured["system_prompt"] = system_prompt
+            return ("output", "sess")
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
+            patch("hiro_agent.review_code._run_report_stream", return_value=None),
+        ):
+            await review_code("diff", cwd=tmp_cwd)
+
+        assert captured["max_turns"] == 10
+        assert "10 turns" in captured["system_prompt"]
+
+    @pytest.mark.asyncio
+    async def test_recon_max_turns_is_5(self, mock_mcp_setup, tmp_cwd):
+        """Recon should use 5 turn budget for diff review."""
+        captured = {}
+
+        async def mock_tracked(*, name, max_turns, system_prompt, **kwargs):
+            if name == "recon":
+                captured["max_turns"] = max_turns
+                captured["system_prompt"] = system_prompt
+            return ("output", "sess")
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
+            patch("hiro_agent.review_code._run_report_stream", return_value=None),
+        ):
+            await review_code("diff", cwd=tmp_cwd)
+
+        assert captured["max_turns"] == 5
+        assert "5 turns" in captured["system_prompt"]
+
+    @pytest.mark.asyncio
+    async def test_report_model_is_opus(self, mock_mcp_setup, tmp_cwd):
+        """Report phase should use opus model."""
+        captured = {}
+
+        async def mock_tracked(*, name, **kwargs):
+            return ("output", "sess")
+
+        async def mock_report(*, model, **kwargs):
+            captured["model"] = model
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
+            patch("hiro_agent.review_code._run_report_stream", side_effect=mock_report),
+        ):
+            await review_code("diff", cwd=tmp_cwd)
+
+        assert captured["model"] == "opus"
+
+    @pytest.mark.asyncio
+    async def test_diff_recon_policy_violation_retries(self, mock_mcp_setup, tmp_cwd):
+        """Diff recon should retry when tool policy blocks an unscoped search."""
+        calls = {"recon": 0}
+
+        async def mock_tracked(*, name, **kwargs):
+            if name == "recon":
+                calls["recon"] += 1
+                if calls["recon"] == 1:
+                    raise ToolPolicyViolationError("**/*.py", "Glob must target a first-party subpath", tool_name="Glob")
+                return ("recon summary", "sess-recon")
+            return ("output", "sess")
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
             patch("hiro_agent.review_code._run_report_stream", return_value=None),
         ):
             await review_code("diff --git a/foo.py", cwd=tmp_cwd)
 
-        for name in SKILL_NAMES:
-            assert name in captured_kwargs
+        assert calls["recon"] == 2
 
-    def test_skill_tools_includes_write(self):
-        """SKILL_TOOLS should include Task and Write (imported from _common)."""
-        from hiro_agent.review_code import SKILL_TOOLS as rc_tools
-        assert "Task" in rc_tools
-        assert "Write" in rc_tools
+    @pytest.mark.asyncio
+    async def test_only_two_tracked_agent_calls(self, mock_mcp_setup, tmp_cwd):
+        """Pipeline should call _run_tracked_agent exactly twice: recon + investigation."""
+        call_names = []
+
+        async def mock_tracked(*, name, **kwargs):
+            call_names.append(name)
+            return ("output", "sess")
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
+            patch("hiro_agent.review_code._run_report_stream", return_value=None),
+        ):
+            await review_code("diff", cwd=tmp_cwd)
+
+        assert call_names == ["recon", "investigation"]

@@ -10,7 +10,7 @@ from hiro_agent.prompts import CHAT_SYSTEM_PROMPT
 
 logger = structlog.get_logger(__name__)
 
-ALLOWED_TOOLS = ["Read", "Grep", "Glob"]
+ALLOWED_TOOLS = ["Read", "Grep"]
 MAX_TURNS = 15
 
 
@@ -19,6 +19,7 @@ async def chat(
     *,
     cwd: str | None = None,
     verbose: bool = False,
+    output_file: str | None = None,
 ) -> None:
     """Ask a security question about the codebase.
 
@@ -37,6 +38,7 @@ async def chat(
         max_turns=MAX_TURNS,
         verbose=verbose,
         model="sonnet",
+        output_file=output_file,
     )
 
     logger.info("chat_completed")
