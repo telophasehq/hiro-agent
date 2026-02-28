@@ -12,6 +12,7 @@ import importlib.resources
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 
 import click
@@ -295,6 +296,59 @@ sys.exit(0)
     click.echo(f"  Installed {precommit}")
 
 
+def _get_claude_desktop_config_path() -> Path | None:
+    """Return the Claude Desktop config path on macOS, None on unsupported platforms."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    return None
+
+
+def _resolve_api_key(project_root: Path) -> str | None:
+    """Return the Hiro API key from env var or .hiro/config.json, or None."""
+    env_key = os.environ.get("HIRO_API_KEY", "")
+    if env_key:
+        return env_key
+    config = _load_project_config(project_root)
+    return config.get("api_key") or None
+
+
+def _setup_claude_desktop(project_root: Path) -> None:
+    """Configure Claude Desktop MCP server entry in the global config."""
+    from hiro_agent._common import HIRO_MCP_URL
+
+    click.echo("Configuring Claude Desktop...")
+
+    config_path = _get_claude_desktop_config_path()
+    if config_path is None:
+        click.echo("  Skipping: Claude Desktop is only supported on macOS.")
+        return
+
+    api_key = _resolve_api_key(project_root)
+    if not api_key:
+        click.echo("  Skipping: No API key found. Set HIRO_API_KEY or run `hiro setup` first.")
+        return
+
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            config = {}
+    else:
+        config = {}
+
+    mcp_servers = config.setdefault("mcpServers", {})
+    mcp_servers["hiro"] = {
+        "url": HIRO_MCP_URL,
+        "headers": {
+            "Authorization": f"Bearer {api_key}",
+        },
+    }
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    click.echo(f"  Wrote {config_path}")
+
+
 def _detect_tools(project_root: Path) -> list[str]:
     """Auto-detect which AI coding tools are in use."""
     tools = []
@@ -307,6 +361,10 @@ def _detect_tools(project_root: Path) -> list[str]:
     # Codex: check for codex config or just always install git hook
     if (project_root / ".codex").is_dir():
         tools.append("codex")
+    # Claude Desktop: detect if config directory exists on macOS
+    desktop_config = _get_claude_desktop_config_path()
+    if desktop_config is not None and desktop_config.parent.is_dir():
+        tools.append("claude-desktop")
     return tools
 
 
@@ -315,6 +373,7 @@ TOOL_SETUP_MAP = {
     "cursor": _setup_cursor,
     "vscode": _setup_vscode,
     "codex": _setup_codex,
+    "claude-desktop": _setup_claude_desktop,
 }
 
 

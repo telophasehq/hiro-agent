@@ -11,9 +11,12 @@ from hiro_agent.setup_hooks import (
     HOOK_FILES,
     _detect_tools,
     _ensure_gitignore,
+    _get_claude_desktop_config_path,
     _get_package_hook_content,
     _install_hooks,
+    _resolve_api_key,
     _setup_claude_code,
+    _setup_claude_desktop,
     _setup_cursor,
     _setup_git_precommit,
     _setup_vscode,
@@ -105,8 +108,27 @@ class TestDetectTools:
         (tmp_path / ".codex").mkdir()
         assert "codex" in _detect_tools(tmp_path)
 
+    def test_detects_claude_desktop(self, tmp_path: Path):
+        fake_config = tmp_path / "Claude" / "claude_desktop_config.json"
+        fake_config.parent.mkdir(parents=True)
+        with patch(
+            "hiro_agent.setup_hooks._get_claude_desktop_config_path",
+            return_value=fake_config,
+        ):
+            assert "claude-desktop" in _detect_tools(tmp_path)
+
+    def test_no_claude_desktop_when_dir_missing(self, tmp_path: Path):
+        fake_config = tmp_path / "Claude" / "claude_desktop_config.json"
+        # Parent dir does NOT exist
+        with patch(
+            "hiro_agent.setup_hooks._get_claude_desktop_config_path",
+            return_value=fake_config,
+        ):
+            assert "claude-desktop" not in _detect_tools(tmp_path)
+
     def test_empty_when_nothing_detected(self, tmp_path: Path):
-        assert _detect_tools(tmp_path) == []
+        with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=None):
+            assert _detect_tools(tmp_path) == []
 
 
 class TestSetupClaudeCode:
@@ -168,6 +190,90 @@ class TestSetupVscode:
         _setup_vscode(tmp_path)
         settings = json.loads((tmp_path / ".vscode" / "settings.json").read_text())
         assert "github.copilot.chat.agent.hooks" in settings
+
+
+class TestSetupClaudeDesktop:
+    """Test Claude Desktop MCP server configuration."""
+
+    def test_writes_config_file(self, tmp_path: Path):
+        config_path = tmp_path / "Claude" / "claude_desktop_config.json"
+        config_path.parent.mkdir(parents=True)
+        (tmp_path / ".hiro").mkdir()
+        (tmp_path / ".hiro" / "config.json").write_text(json.dumps({"api_key": "test-key-123"}))
+
+        with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=config_path):
+            _setup_claude_desktop(tmp_path)
+
+        assert config_path.exists()
+        config = json.loads(config_path.read_text())
+        assert "mcpServers" in config
+        assert "hiro" in config["mcpServers"]
+        assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer test-key-123"
+
+    def test_preserves_existing_mcp_servers(self, tmp_path: Path):
+        config_path = tmp_path / "Claude" / "claude_desktop_config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({
+            "mcpServers": {
+                "other-tool": {"url": "https://other.example.com/mcp"},
+            }
+        }))
+        (tmp_path / ".hiro").mkdir()
+        (tmp_path / ".hiro" / "config.json").write_text(json.dumps({"api_key": "test-key"}))
+
+        with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=config_path):
+            _setup_claude_desktop(tmp_path)
+
+        config = json.loads(config_path.read_text())
+        assert "other-tool" in config["mcpServers"]
+        assert "hiro" in config["mcpServers"]
+
+    def test_skips_when_no_api_key(self, tmp_path: Path):
+        config_path = tmp_path / "Claude" / "claude_desktop_config.json"
+        config_path.parent.mkdir(parents=True)
+
+        with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=config_path):
+            with patch.dict(os.environ, {}, clear=False):
+                # Ensure no HIRO_API_KEY in env
+                os.environ.pop("HIRO_API_KEY", None)
+                _setup_claude_desktop(tmp_path)
+
+        assert not config_path.exists()
+
+    def test_skips_on_unsupported_platform(self, tmp_path: Path):
+        with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=None):
+            _setup_claude_desktop(tmp_path)
+        # No config written anywhere — just verifying no error
+
+    def test_uses_env_var_key(self, tmp_path: Path):
+        config_path = tmp_path / "Claude" / "claude_desktop_config.json"
+        config_path.parent.mkdir(parents=True)
+
+        with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=config_path):
+            with patch.dict(os.environ, {"HIRO_API_KEY": "env-key-456"}):
+                _setup_claude_desktop(tmp_path)
+
+        config = json.loads(config_path.read_text())
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer env-key-456"
+
+    def test_updates_existing_hiro_entry(self, tmp_path: Path):
+        config_path = tmp_path / "Claude" / "claude_desktop_config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({
+            "mcpServers": {
+                "hiro": {"url": "https://old.example.com/mcp", "headers": {"Authorization": "Bearer old-key"}},
+            }
+        }))
+        (tmp_path / ".hiro").mkdir()
+        (tmp_path / ".hiro" / "config.json").write_text(json.dumps({"api_key": "new-key"}))
+
+        with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=config_path):
+            _setup_claude_desktop(tmp_path)
+
+        config = json.loads(config_path.read_text())
+        assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer new-key"
 
 
 class TestSetupGitPrecommit:

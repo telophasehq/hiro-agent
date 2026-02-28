@@ -201,6 +201,7 @@ def chat(question: tuple[str, ...], quiet: bool, output_file: str | None) -> Non
 @click.option("--cursor", "tools", flag_value="cursor", help="Cursor only.")
 @click.option("--vscode", "tools", flag_value="vscode", help="VSCode Copilot only.")
 @click.option("--codex", "tools", flag_value="codex", help="Codex CLI only.")
+@click.option("--claude-desktop", "tools", flag_value="claude-desktop", help="Claude Desktop only.")
 def setup(tools: str | None) -> None:
     """Configure AI coding tool hooks for security review enforcement."""
     from hiro_agent.setup_hooks import run_setup
@@ -213,6 +214,7 @@ def setup(tools: str | None) -> None:
 @click.option("--cursor", "tools", flag_value="cursor", help="Cursor only.")
 @click.option("--vscode", "tools", flag_value="vscode", help="VSCode Copilot only.")
 @click.option("--codex", "tools", flag_value="codex", help="Codex CLI only.")
+@click.option("--claude-desktop", "tools", flag_value="claude-desktop", help="Claude Desktop only.")
 def upgrade(tools: str | None) -> None:
     """Update hooks and tool configs to the latest version."""
     from hiro_agent.setup_hooks import run_upgrade
