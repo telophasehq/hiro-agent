@@ -137,6 +137,17 @@ def main() -> int:
         _allow()
         return 0
 
+    # --- PreToolUse: force hiro commands to write to file ---
+    if event == "PreToolUse" and _is_review_command(tool_name, tool_input):
+        if tool_input.get("run_in_background"):
+            _deny(
+                "Hiro commands must not run in the background. "
+                "Re-run the same command with --output .hiro/.state/code-review.md "
+                "in the foreground, then use the Read tool on "
+                ".hiro/.state/code-review.md to read the report."
+            )
+            return 0
+
     # --- PreToolUse: block git commit if review is pending ---
     if event == "PreToolUse" and tool_name == "Bash":
         command = tool_input.get("command", "")
