@@ -219,7 +219,7 @@ wheels = [
 
 [[package]]
 name = "hiro-agent"
-version = "0.1.2"
+version = "0.1.4"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },

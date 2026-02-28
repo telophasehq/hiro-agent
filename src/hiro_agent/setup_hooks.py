@@ -89,7 +89,9 @@ def _install_hooks(project_root: Path) -> None:
 
 
 def _setup_claude_code(project_root: Path) -> None:
-    """Configure Claude Code hooks in .claude/settings.local.json."""
+    """Configure Claude Code hooks in .claude/settings.local.json and MCP servers in .mcp.json."""
+    from hiro_agent._common import HIRO_MCP_URL, HIRO_NOTIFICATIONS_MCP_URL
+
     click.echo("Configuring Claude Code...")
 
     settings_dir = project_root / ".claude"
@@ -154,6 +156,38 @@ def _setup_claude_code(project_root: Path) -> None:
     settings["hooks"] = hooks_config
     settings_file.write_text(json.dumps(settings, indent=2) + "\n")
     click.echo(f"  Wrote {settings_file}")
+
+    # Configure MCP servers in .mcp.json (merge, don't overwrite)
+    api_key = _resolve_api_key(project_root)
+    if not api_key:
+        click.echo("  Skipping .mcp.json: No API key found.")
+        return
+
+    mcp_file = project_root / ".mcp.json"
+    if mcp_file.exists():
+        try:
+            mcp_config = json.loads(mcp_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            mcp_config = {}
+    else:
+        mcp_config = {}
+
+    mcp_servers = mcp_config.setdefault("mcpServers", {})
+    auth_headers = {"Authorization": f"Bearer {api_key}"}
+
+    mcp_servers["hiro"] = {
+        "type": "http",
+        "url": HIRO_MCP_URL,
+        "headers": auth_headers,
+    }
+    mcp_servers["hiro-findings"] = {
+        "type": "http",
+        "url": HIRO_NOTIFICATIONS_MCP_URL,
+        "headers": auth_headers,
+    }
+
+    mcp_file.write_text(json.dumps(mcp_config, indent=2) + "\n")
+    click.echo(f"  Wrote {mcp_file}")
 
 
 def _setup_cursor(project_root: Path) -> None:
@@ -313,8 +347,8 @@ def _resolve_api_key(project_root: Path) -> str | None:
 
 
 def _setup_claude_desktop(project_root: Path) -> None:
-    """Configure Claude Desktop MCP server entry in the global config."""
-    from hiro_agent._common import HIRO_MCP_URL
+    """Configure Claude Desktop MCP server entries in the global config."""
+    from hiro_agent._common import HIRO_MCP_URL, HIRO_NOTIFICATIONS_MCP_URL
 
     click.echo("Configuring Claude Desktop...")
 
@@ -337,11 +371,15 @@ def _setup_claude_desktop(project_root: Path) -> None:
         config = {}
 
     mcp_servers = config.setdefault("mcpServers", {})
+    auth_headers = {"Authorization": f"Bearer {api_key}"}
+
     mcp_servers["hiro"] = {
         "url": HIRO_MCP_URL,
-        "headers": {
-            "Authorization": f"Bearer {api_key}",
-        },
+        "headers": auth_headers,
+    }
+    mcp_servers["hiro-findings"] = {
+        "url": HIRO_NOTIFICATIONS_MCP_URL,
+        "headers": auth_headers,
     }
 
     config_path.parent.mkdir(parents=True, exist_ok=True)

@@ -47,6 +47,7 @@ logger = structlog.get_logger(__name__)
 
 # Hardcoded — not configurable to prevent SSRF. HTTPS enforced.
 HIRO_MCP_URL = "https://api.hiro.is/mcp/architect/mcp"
+HIRO_NOTIFICATIONS_MCP_URL = "https://api.hiro.is/mcp/notifications/mcp"
 HIRO_BACKEND_URL = "https://api.hiro.is"
 
 _EXPLORE_AGENT = AgentDefinition(

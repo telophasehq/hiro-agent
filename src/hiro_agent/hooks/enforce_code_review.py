@@ -170,6 +170,24 @@ def main() -> int:
                     "to read the report."
                 )
             return 0
+        if cmd and "--output" not in cmd and "-o" not in cmd:
+            is_plan = "review-plan" in cmd or "review_plan" in cmd
+            if is_plan:
+                _deny(
+                    "Missing --output flag. Use:\n"
+                    "  hiro review-plan --file /path/to/plan.md "
+                    "--output .hiro/.state/plan-review.md\n"
+                    "Then use the Read tool on .hiro/.state/plan-review.md "
+                    "to read the report."
+                )
+            else:
+                _deny(
+                    "Missing --output flag. Use:\n"
+                    "  hiro review-code --output .hiro/.state/code-review.md\n"
+                    "Then use the Read tool on .hiro/.state/code-review.md "
+                    "to read the report."
+                )
+            return 0
 
     # --- PreToolUse: block git commit if review is pending ---
     if event == "PreToolUse" and tool_name == "Bash":
