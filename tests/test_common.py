@@ -1140,7 +1140,7 @@ class TestScanDisplay:
 
     def test_agent_incomplete_status(self):
         """agent_incomplete() should mark terminal warning state."""
-        display = _ScanDisplay(["auth"])
+        display = _ScanDisplay(["auth", "injection"])
         display._phase = 2
 
         display.agent_started("auth")
@@ -1152,7 +1152,7 @@ class TestScanDisplay:
 
     def test_build_lines_pending(self):
         """All agents pending should show ○ markers."""
-        display = _ScanDisplay(["auth"])
+        display = _ScanDisplay(["auth", "injection"])
         display._phase = 2
         lines = display._build_lines()
         joined = "\n".join(lines)
@@ -1184,7 +1184,7 @@ class TestScanDisplay:
 
     def test_build_lines_shows_todos(self):
         """Todo items should appear in _build_lines() output for running agents."""
-        display = _ScanDisplay(["auth"])
+        display = _ScanDisplay(["auth", "injection"])
         display._phase = 2
         display._agent_status["auth"] = "running"
         display._agent_tool["auth"] = "Read(auth.py)"
@@ -1211,7 +1211,7 @@ class TestScanDisplay:
         """Should cap todo items at _MAX_TODO_LINES and show overflow indicator."""
         from hiro_agent._common import _MAX_TODO_LINES
 
-        display = _ScanDisplay(["auth"])
+        display = _ScanDisplay(["auth", "injection"])
         display._phase = 2
         display._agent_status["auth"] = "running"
         display._agent_tool["auth"] = "Read(auth.py)"
@@ -1298,7 +1298,7 @@ class TestScanDisplay:
 
     def test_build_lines_shows_task_progress_counts(self):
         """Running/completed agents should show todo progress counts."""
-        display = _ScanDisplay(["auth"])
+        display = _ScanDisplay(["auth", "injection"])
         display._phase = 2
 
         display.agent_started("auth")
@@ -1322,7 +1322,7 @@ class TestScanDisplay:
 
     def test_build_lines_shows_findings_progress(self):
         """Running agents should show findings count based on finding JSON writes."""
-        display = _ScanDisplay(["auth"])
+        display = _ScanDisplay(["auth", "injection"])
         display._phase = 2
         display.agent_started("auth")
 
