@@ -21,7 +21,6 @@ VALID_GATES: tuple[str, ...] = (
 
 _IGNORED_DIRS: set[str] = {
     ".cache",
-    ".claude",
     ".git",
     ".mypy_cache",
     ".next",

@@ -131,7 +131,7 @@ def _setup_claude_code(project_root: Path) -> None:
         ],
         "PostToolUse": [
             {
-                "matcher": "Bash|mcp__hiro__review_plan",
+                "matcher": "Bash|mcp__hiro__review_diff|mcp__hiro__review_plan",
                 "hooks": [
                     {
                         "type": "command",
@@ -141,7 +141,7 @@ def _setup_claude_code(project_root: Path) -> None:
                 ],
             },
             {
-                "matcher": "Edit|Write|Bash",
+                "matcher": "Edit|Write|Bash|mcp__hiro__review_diff|mcp__hiro__review_code",
                 "hooks": [
                     {
                         "type": "command",
@@ -256,7 +256,7 @@ def _setup_vscode(project_root: Path) -> None:
         ],
         "PostToolUse": [
             {
-                "matcher": "Edit|Write|Bash",
+                "matcher": "Edit|Write|Bash|mcp__hiro__review_diff|mcp__hiro__review_code",
                 "hooks": [
                     {
                         "type": "command",

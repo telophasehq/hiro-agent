@@ -47,6 +47,7 @@ logger = structlog.get_logger(__name__)
 
 # Hardcoded — not configurable to prevent SSRF. HTTPS enforced.
 HIRO_MCP_URL = "https://api.hiro.is/mcp/architect/mcp"
+HIRO_INTERNAL_MCP_URL = "https://api.hiro.is/mcp/architect/internal/mcp"
 HIRO_NOTIFICATIONS_MCP_URL = "https://api.hiro.is/mcp/notifications/mcp"
 HIRO_BACKEND_URL = "https://api.hiro.is"
 
@@ -161,18 +162,21 @@ def _check_mcp_connection(api_key: str) -> str | None:
         return f"{e}"
 
 
-def _mcp_call_tool(api_key: str, tool_name: str, arguments: dict | None = None, *, timeout: int = 5) -> str | None:
+def _mcp_call_tool(api_key: str, tool_name: str, arguments: dict | None = None, *, timeout: int = 5, url: str | None = None) -> str | None:
     """Call an MCP tool via direct JSON-RPC POST and return the text result.
 
     Sends a JSON-RPC request to the MCP Streamable HTTP endpoint and parses
     the SSE response to extract the tool result. Returns None on any failure
     (network error, timeout, bad response) so callers can degrade gracefully.
+
+    Args:
+        url: Override the MCP endpoint URL. Defaults to HIRO_MCP_URL.
     """
     import http.client
     import ssl
     from urllib.parse import urlparse
 
-    parsed = urlparse(HIRO_MCP_URL)
+    parsed = urlparse(url or HIRO_MCP_URL)
     body = json.dumps({
         "jsonrpc": "2.0",
         "method": "tools/call",
@@ -232,8 +236,8 @@ async def _prefetch_mcp_context(api_key: str) -> tuple[str | None, str | None]:
     Returns (org_context, security_policy) — either may be None on failure.
     """
     org_ctx, sec_pol = await asyncio.gather(
-        asyncio.to_thread(_mcp_call_tool, api_key, "get_org_context"),
-        asyncio.to_thread(_mcp_call_tool, api_key, "get_security_policy"),
+        asyncio.to_thread(_mcp_call_tool, api_key, "get_org_context", None, url=HIRO_INTERNAL_MCP_URL),
+        asyncio.to_thread(_mcp_call_tool, api_key, "get_security_policy", None, url=HIRO_INTERNAL_MCP_URL),
     )
     return org_ctx, sec_pol
 
@@ -248,7 +252,7 @@ async def _prefetch_review_context(api_key: str, diff: str) -> str | None:
     Returns the context string or None on failure.
     """
     return await asyncio.to_thread(
-        _mcp_call_tool, api_key, "get_review_context", {"diff": diff}, timeout=30,
+        _mcp_call_tool, api_key, "get_review_context", {"diff": diff}, timeout=30, url=HIRO_INTERNAL_MCP_URL,
     )
 
 

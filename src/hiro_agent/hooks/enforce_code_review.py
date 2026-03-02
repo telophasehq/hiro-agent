@@ -93,7 +93,7 @@ def _is_git_commit(command: str) -> bool:
 
 def _is_review_command(tool_name: str, tool_input: dict[str, Any]) -> bool:
     """Check if this is a hiro review action (MCP tool or CLI command)."""
-    if tool_name in ("mcp__hiro__review_code", "mcp__hiro__review_plan"):
+    if tool_name in ("mcp__hiro__review_code", "mcp__hiro__review_diff", "mcp__hiro__review_plan"):
         return True
     if tool_name == "Bash":
         cmd = tool_input.get("command", "")
