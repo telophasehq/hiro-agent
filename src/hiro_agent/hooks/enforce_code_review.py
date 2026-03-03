@@ -151,31 +151,12 @@ def main() -> int:
                 "use the Read tool on the output file to read the report."
             )
             return 0
-        if "|" in cmd:
-            is_plan = "review-plan" in cmd or "review_plan" in cmd
-            if is_plan:
-                _deny(
-                    "Do not pipe into hiro review-plan. Use the --file flag instead:\n"
-                    "  hiro review-plan --file /path/to/plan.md "
-                    "--output .hiro/.state/plan-review.md\n"
-                    "Then use the Read tool on .hiro/.state/plan-review.md "
-                    "to read the report."
-                )
-            else:
-                _deny(
-                    "Do not pipe into hiro review-code. Use positional args instead:\n"
-                    "  hiro review-code --output .hiro/.state/code-review.md\n"
-                    "(It reads the git diff automatically.)\n"
-                    "Then use the Read tool on .hiro/.state/code-review.md "
-                    "to read the report."
-                )
-            return 0
         if cmd and "--output" not in cmd and "-o" not in cmd:
             is_plan = "review-plan" in cmd or "review_plan" in cmd
             if is_plan:
                 _deny(
                     "Missing --output flag. Use:\n"
-                    "  hiro review-plan --file /path/to/plan.md "
+                    "  cat /path/to/plan.md | hiro review-plan "
                     "--output .hiro/.state/plan-review.md\n"
                     "Then use the Read tool on .hiro/.state/plan-review.md "
                     "to read the report."
@@ -183,7 +164,7 @@ def main() -> int:
             else:
                 _deny(
                     "Missing --output flag. Use:\n"
-                    "  hiro review-code --output .hiro/.state/code-review.md\n"
+                    "  git diff | hiro review-code --output .hiro/.state/code-review.md\n"
                     "Then use the Read tool on .hiro/.state/code-review.md "
                     "to read the report."
                 )
