@@ -644,6 +644,36 @@ class TestRunTrackedAgent:
         assert session_id == ""  # No ResultMessage in mock
 
     @pytest.mark.asyncio
+    async def test_adds_proxy_tool_turn_constraint_with_hiro_key(self):
+        """Tracked agents should serialize tool use when routed through Hiro proxy."""
+        from claude_agent_sdk import AssistantMessage, TextBlock
+
+        captured_options = {}
+        msg = AssistantMessage(
+            content=[TextBlock(text="skill findings here")],
+            model="claude-sonnet-4-5-20250514",
+        )
+
+        async def mock_query(prompt, options):
+            captured_options.update(vars(options))
+            yield msg
+
+        setup = McpSetup(mcp_config={}, mcp_tools=[], org_context=None, security_policy=None)
+
+        with (
+            patch("hiro_agent._common.query", side_effect=mock_query),
+            patch.dict(os.environ, {"HIRO_API_KEY": "hiro_ak_test"}),
+        ):
+            await _run_tracked_agent(
+                name="auth",
+                prompt="investigate auth",
+                system_prompt="system",
+                cwd="/tmp",
+                allowed_tools=["Read"],
+                mcp_setup=setup,
+            )
+
+    @pytest.mark.asyncio
     async def test_calls_on_tool_callback(self):
         """Should call on_tool for each ToolUseBlock."""
         from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock

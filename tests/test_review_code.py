@@ -317,6 +317,33 @@ class TestReviewCode:
         assert captured["model"] == "opus"
 
     @pytest.mark.asyncio
+    async def test_report_receives_output_file_settings(self, mock_mcp_setup, tmp_cwd):
+        """Report phase should receive output file and mirror settings."""
+        captured = {}
+
+        async def mock_tracked(*, name, **kwargs):
+            return ("output", "sess")
+
+        async def mock_report(*, output_file, mirror_to_stdout, **kwargs):
+            captured["output_file"] = output_file
+            captured["mirror_to_stdout"] = mirror_to_stdout
+
+        with (
+            patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_code._run_tracked_agent", side_effect=mock_tracked),
+            patch("hiro_agent.review_code._run_report_stream", side_effect=mock_report),
+        ):
+            await review_code(
+                "diff",
+                cwd=tmp_cwd,
+                output_file="/tmp/review.md",
+                mirror_to_stdout=True,
+            )
+
+        assert captured["output_file"] == "/tmp/review.md"
+        assert captured["mirror_to_stdout"] is True
+
+    @pytest.mark.asyncio
     async def test_diff_recon_policy_violation_retries(self, mock_mcp_setup, tmp_cwd):
         """Diff recon should retry when tool policy blocks an unscoped search."""
         calls = {"recon": 0}

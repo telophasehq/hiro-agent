@@ -34,7 +34,6 @@ async def review_plan(
     cwd: str | None = None,
     context: str = "",
     verbose: bool = False,
-    output_file: str | None = None,
 ) -> None:
     """Run a single-agent STRIDE threat model review on an implementation plan.
 
@@ -180,6 +179,7 @@ async def review_plan(
             mcp_setup=mcp_setup,
             max_turns=investigation_max_turns,
             model="opus",
+            thinking_budget=30_000,
             on_tool=_on_investigation_tool,
             on_tool_event=_on_investigation_tool_event,
         )
@@ -210,7 +210,7 @@ async def review_plan(
             mcp_setup=mcp_setup,
             model="opus",
             is_tty=is_tty,
-            output_file=output_file,
+            output_file=None,
         )
         logger.info("phase_completed", phase="report", duration_s=round(_time.monotonic() - t0, 1))
 

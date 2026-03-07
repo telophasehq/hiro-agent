@@ -1179,6 +1179,7 @@ async def _run_tracked_agent(
     max_turns: int = 15,
     model: str = "sonnet",
     effort: str | None = None,
+    thinking_budget: int | None = None,
     on_tool: Callable[[str, str, str, bool], None] | None = None,
     on_tool_event: Callable[[str, str, dict, bool], None] | None = None,
     on_result: Callable[[ResultMessage], None] | None = None,
@@ -1205,24 +1206,46 @@ async def _run_tracked_agent(
         system_prompt, mcp_setup.org_context, mcp_setup.security_policy,
         mcp_setup.review_context,
     )
-
     parent_tools = allowed_tools + list(mcp_setup.mcp_tools)
     # Auto-approve sub-agent tools (Read/Grep) so explore agents
     # can actually use them — without this they're silently blocked.
     subagent_tools = list(_EXPLORE_AGENT.tools or [])
+
+    # Mutable timestamp updated by the stderr callback as a heartbeat.
+    # Stderr lines arrive on a background task even while __anext__() is
+    # blocked during extended thinking, preventing false stall timeouts.
+    _heartbeat = [_time.monotonic()]
+
+    def _stderr_heartbeat(line: str) -> None:
+        _heartbeat[0] = _time.monotonic()
+        logger.debug("cli_stderr", agent=name, line=line.rstrip())
+
+    _thinking_config = (
+        {"type": "enabled", "budget_tokens": thinking_budget}
+        if thinking_budget is not None
+        else None
+    )
+    # Block MCP tools that internally call LLMs (Bedrock Opus) to prevent
+    # nested Opus-calling-Opus loops that can run for 60+ minutes.
+    _disallowed_mcp_tools = [
+        "mcp__hiro__review_diff",
+        "mcp__hiro__ask",
+    ]
     options = ClaudeAgentOptions(
         cwd=cwd,
         tools=parent_tools,
         allowed_tools=parent_tools + subagent_tools,
+        disallowed_tools=_disallowed_mcp_tools,
         system_prompt=full_system,
         mcp_servers=mcp_setup.mcp_config,
         permission_mode="acceptEdits",
         max_turns=max_turns,
         model=model,
         effort=effort,
+        thinking=_thinking_config,
         agents={"explore": _EXPLORE_AGENT},
         env=_get_agent_env(),
-        stderr=lambda line: logger.debug("cli_stderr", agent=name, line=line.rstrip()),
+        stderr=_stderr_heartbeat,
     )
 
     run_started_at = _time.monotonic()
@@ -1259,7 +1282,7 @@ async def _run_tracked_agent(
     # asyncio.wait with a timeout, then cancel the orphaned task on stall.
     # A watchdog also watches for the primary-agent-silent case (sub-agent
     # chatting but primary stuck) and sets a flag checked after each message.
-    _default_stall_timeout = 120.0 if model == "sonnet" else 300.0
+    _default_stall_timeout = 120.0 if model == "sonnet" else 900.0
     try:
         stall_timeout = float(os.environ.get("HIRO_AGENT_STALL_TIMEOUT", str(_default_stall_timeout)))
     except ValueError:
@@ -1285,10 +1308,11 @@ async def _run_tracked_agent(
         nonlocal stall_timed_out, next_idle_log_at
         while True:
             await asyncio.sleep(10)
-            # Use primary agent activity — sub-agent messages should not
-            # reset the stall timer, as the primary agent may be genuinely
-            # stuck while sub-agents chatter.
-            elapsed = _time.monotonic() - last_primary_message_at
+            now = _time.monotonic()
+            # Use the most recent activity signal: primary-agent messages
+            # OR stderr heartbeats (which arrive during extended thinking).
+            last_activity = max(last_primary_message_at, _heartbeat[0])
+            elapsed = now - last_activity
             if elapsed >= next_idle_log_at:
                 logger.info(
                     "agent_waiting_for_messages",
@@ -1317,17 +1341,31 @@ async def _run_tracked_agent(
         while True:
             # Wrap __anext__() in asyncio.wait so we can enforce a hard
             # per-message timeout without cancelling the stream's scope.
+            # Use short polling intervals so stderr heartbeats (which
+            # arrive during extended thinking) can prevent false stalls.
             _next = asyncio.ensure_future(stream.__anext__())
-            done, _ = await asyncio.wait({_next}, timeout=stall_timeout)
-            if not done:
-                # Hard per-message timeout fired.
-                stall_timed_out = True
-                logger.error(
-                    "agent_stall_timeout",
-                    agent=name,
-                    timeout_s=stall_timeout,
-                    elapsed_s=round(_time.monotonic() - last_primary_message_at, 1),
-                )
+            _poll_interval = 30.0
+            _msg_ready = False
+            while True:
+                done, _ = await asyncio.wait({_next}, timeout=_poll_interval)
+                if done:
+                    _msg_ready = True
+                    break
+                # Check heartbeat: stderr activity resets the clock.
+                last_activity = max(last_primary_message_at, _heartbeat[0])
+                if (_time.monotonic() - last_activity) >= stall_timeout:
+                    stall_timed_out = True
+                    logger.error(
+                        "agent_stall_timeout",
+                        agent=name,
+                        timeout_s=stall_timeout,
+                        elapsed_s=round(_time.monotonic() - last_activity, 1),
+                    )
+                    break
+                # Also bail if the watchdog already flagged a stall.
+                if stall_timed_out:
+                    break
+            if not _msg_ready:
                 _next.cancel()
                 with contextlib.suppress(asyncio.CancelledError, RuntimeError, StopAsyncIteration):
                     await _next
@@ -2222,6 +2260,7 @@ async def _run_report_stream(
     model: str = "opus",
     is_tty: bool = True,
     output_file: str | None = None,
+    mirror_to_stdout: bool = False,
 ) -> None:
     """Stream the final report to stdout (or a file via ``output_file``). No tools, single turn."""
     _install_cancel_scope_handler()
@@ -2239,6 +2278,7 @@ async def _run_report_stream(
         max_turns=1,
         model=model,
         effort="medium",
+        thinking={"type": "enabled", "budget_tokens": 10_000},
         env=_get_agent_env(),
         stderr=lambda line: logger.debug("cli_stderr", agent="report", line=line.rstrip()),
     )
@@ -2286,7 +2326,7 @@ async def _run_report_stream(
                         if out_fh:
                             out_fh.write(block.text + "\n")
                             out_fh.flush()
-                        else:
+                        if not out_fh or mirror_to_stdout:
                             print(block.text, flush=True)
     finally:
         await _safe_close_query_stream(stream, context="run_report_stream")

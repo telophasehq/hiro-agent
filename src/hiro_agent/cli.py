@@ -5,6 +5,7 @@ import datetime
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import click
@@ -47,6 +48,13 @@ def _configure_file_logging() -> str:
 MAX_STDIN_BYTES = 2 * 1024 * 1024
 
 
+def _default_review_output_path(command_name: str) -> str:
+    """Return a durable temp file path for background-safe review output."""
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"hiro-{command_name}-{ts}-{os.getpid()}.md"
+    return str(Path(tempfile.gettempdir()) / filename)
+
+
 def _read_stdin(command_name: str) -> str:
     """Read stdin with a 2MB size cap."""
     if sys.stdin.isatty():
@@ -73,7 +81,7 @@ def main() -> None:
 @main.command("review-code")
 @click.option("--context", "-c", default="", help="Additional context about the code.")
 @click.option("--quiet", "-q", is_flag=True, help="Hide tool calls and agent reasoning.")
-@click.option("--output", "-o", "output_file", default=None, type=click.Path(), help="Write report to file instead of stdout.")
+@click.option("--output", "-o", "output_file", default=None, type=click.Path(), help="Write review to file. Defaults to a temp file announced before the review starts.")
 def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     """Review code changes for security issues. Reads diff from stdin."""
     from hiro_agent.review_code import review_code
@@ -86,36 +94,38 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
         raise SystemExit(1)
 
     cwd = os.getcwd()
-    asyncio.run(review_code(diff, cwd=cwd, context=context, verbose=not quiet, output_file=output_file))
-    if output_file:
-        click.echo(f"Report written to {output_file}", err=True)
+    review_output = output_file or _default_review_output_path("review-code")
+    click.echo(f"outputting review to {review_output}")
+    asyncio.run(
+        review_code(
+            diff,
+            cwd=cwd,
+            context=context,
+            verbose=not quiet,
+            output_file=review_output,
+            mirror_to_stdout=sys.stdout.isatty(),
+        )
+    )
     click.echo(f"\nLog: {log_path}", err=True)
 
 
 @main.command("review-plan")
 @click.option("--context", "-c", default="", help="Additional context about the plan.")
 @click.option("--quiet", "-q", is_flag=True, help="Hide tool calls and agent reasoning.")
-@click.option("--file", "-f", "file_path", default=None, type=click.Path(exists=True), help="Path to plan file (alternative to stdin).")
-@click.option("--output", "-o", "output_file", default=None, type=click.Path(), help="Write report to file instead of stdout.")
-def review_plan_cmd(context: str, quiet: bool, file_path: str | None, output_file: str | None) -> None:
-    """Review an implementation plan for security concerns. Reads from --file or stdin."""
+def review_plan_cmd(context: str, quiet: bool) -> None:
+    """Review an implementation plan for security concerns. Reads from stdin."""
     from hiro_agent.review_plan import review_plan
 
     log_path = _configure_file_logging()
 
-    if file_path:
-        plan = Path(file_path).read_text(encoding="utf-8")
-    else:
-        plan = _read_stdin("review-plan")
+    plan = _read_stdin("review-plan")
     if not plan.strip():
-        click.echo("Error: Empty input. Usage: hiro review-plan --file plan.md", err=True)
+        click.echo("Error: Empty input. Pipe a plan: cat plan.md | hiro review-plan", err=True)
         raise SystemExit(1)
 
     cwd = os.getcwd()
     click.echo("Reviewing plan...\n", err=True)
-    asyncio.run(review_plan(plan, cwd=cwd, context=context, verbose=not quiet, output_file=output_file))
-    if output_file:
-        click.echo(f"Report written to {output_file}", err=True)
+    asyncio.run(review_plan(plan, cwd=cwd, context=context, verbose=not quiet))
     click.echo(f"\nLog: {log_path}", err=True)
 
 

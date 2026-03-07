@@ -55,6 +55,7 @@ async def review_code(
     context: str = "",
     verbose: bool = False,
     output_file: str | None = None,
+    mirror_to_stdout: bool = False,
 ) -> None:
     """Run a single-agent security review of a diff.
 
@@ -205,6 +206,7 @@ async def review_code(
             mcp_setup=mcp_setup,
             max_turns=investigation_max_turns,
             model="opus",
+            thinking_budget=30_000,
             on_tool=_on_investigation_tool,
             on_tool_event=_on_investigation_tool_event,
         )
@@ -236,6 +238,7 @@ async def review_code(
             model="opus",
             is_tty=is_tty,
             output_file=output_file,
+            mirror_to_stdout=mirror_to_stdout,
         )
         logger.info("phase_completed", phase="report", duration_s=round(_time.monotonic() - t0, 1))
 
