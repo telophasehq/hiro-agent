@@ -96,6 +96,7 @@ def _setup_claude_code(project_root: Path) -> None:
 
     settings_dir = project_root / ".claude"
     settings_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(settings_dir, stat.S_IRWXU)  # 0700
     settings_file = settings_dir / "settings.local.json"
 
     if settings_file.exists():
@@ -155,6 +156,7 @@ def _setup_claude_code(project_root: Path) -> None:
 
     settings["hooks"] = hooks_config
     settings_file.write_text(json.dumps(settings, indent=2) + "\n")
+    os.chmod(settings_file, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     click.echo(f"  Wrote {settings_file}")
 
     # Configure MCP servers in .mcp.json (merge, don't overwrite)
@@ -187,6 +189,7 @@ def _setup_claude_code(project_root: Path) -> None:
     }
 
     mcp_file.write_text(json.dumps(mcp_config, indent=2) + "\n")
+    os.chmod(mcp_file, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     click.echo(f"  Wrote {mcp_file}")
 
 
@@ -383,7 +386,9 @@ def _setup_claude_desktop(project_root: Path) -> None:
     }
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(config_path.parent, stat.S_IRWXU)  # 0700
     config_path.write_text(json.dumps(config, indent=2) + "\n")
+    os.chmod(config_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     click.echo(f"  Wrote {config_path}")
 
 
