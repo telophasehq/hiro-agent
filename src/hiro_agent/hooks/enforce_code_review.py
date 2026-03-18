@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -37,10 +38,17 @@ def _git_root() -> Path:
 
 STATE_DIR = _git_root() / ".hiro" / ".state"
 
+_SESSION_ID_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
+
 
 def _state_path(session_id: str) -> Path:
+    if not _SESSION_ID_RE.match(session_id):
+        raise ValueError(f"Invalid session_id: {session_id!r}")
     safe = session_id.replace("/", "_")
-    return STATE_DIR / f"code_review_{safe}.json"
+    path = STATE_DIR / f"code_review_{safe}.json"
+    if not path.resolve().is_relative_to(STATE_DIR.resolve()):
+        raise ValueError(f"Path escapes state directory: {session_id!r}")
+    return path
 
 
 def _load(session_id: str) -> dict[str, Any]:
