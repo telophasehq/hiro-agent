@@ -36,6 +36,65 @@ logger = structlog.get_logger(__name__)
 
 RECON_TOOLS = ["Read", "Grep", "TodoWrite", "TodoRead"]
 
+# TTL for scratchpad cleanup (24 hours)
+SCRATCHPAD_TTL_SECONDS = 24 * 60 * 60
+
+
+def _redact_secrets(text: str) -> str:
+    """Mask secret-like values in text to prevent cleartext exposure.
+
+    Detects and redacts:
+    - AWS keys (AKIA...)
+    - Long hex strings (likely keys/tokens)
+    - Long base64 strings (likely encoded secrets)
+
+    Returns text with secrets masked as first4****last4.
+    """
+    import re
+
+    # AWS access key pattern (AKIA followed by 16 alphanumeric)
+    text = re.sub(
+        r'\b(AKIA[0-9A-Z]{4})[0-9A-Z]{8}([0-9A-Z]{4})\b',
+        r'\1****\2',
+        text
+    )
+
+    # Long hex strings (32+ chars, likely API keys/tokens)
+    text = re.sub(
+        r'\b([0-9a-fA-F]{4})[0-9a-fA-F]{24,}([0-9a-fA-F]{4})\b',
+        r'\1****\2',
+        text
+    )
+
+    # Long base64-like strings (40+ chars)
+    text = re.sub(
+        r'\b([A-Za-z0-9+/]{4})[A-Za-z0-9+/]{32,}([A-Za-z0-9+/=]{4})\b',
+        r'\1****\2',
+        text
+    )
+
+    return text
+
+
+def _cleanup_stale_scratchpad(scratchpad_dir: Path) -> None:
+    """Remove scratchpad files older than TTL to prevent secret accumulation."""
+    if not scratchpad_dir.exists():
+        return
+
+    import time
+    now = time.time()
+    cutoff = now - SCRATCHPAD_TTL_SECONDS
+
+    for item in scratchpad_dir.iterdir():
+        try:
+            if item.is_file():
+                mtime = item.stat().st_mtime
+                if mtime < cutoff:
+                    item.unlink()
+                    logger.info("scratchpad_ttl_cleanup", file=str(item), age_hours=round((now - mtime) / 3600, 1))
+        except (OSError, ValueError):
+            continue
+
 
 async def scan(
     *,
@@ -70,6 +129,9 @@ async def scan(
     scratchpad_dir = Path(cwd or ".") / ".hiro" / ".scratchpad"
     shared_index_path = Path(cwd or ".") / ".hiro" / ".scan_index.json"
     completed_successfully = False
+
+    # Clean up stale scratchpad files from previous failed scans
+    _cleanup_stale_scratchpad(scratchpad_dir)
 
     try:
         # -- Phase 1: Reconnaissance -----------------------------------------
@@ -223,6 +285,8 @@ async def scan(
 
         t_investigations = _time.monotonic()
         scratchpad_dir.mkdir(parents=True, exist_ok=True)
+        # Set restrictive permissions (0o700) to protect sensitive findings
+        os.chmod(scratchpad_dir, 0o700)
         skill_concurrency = min(
             len(SKILL_NAMES),
             max(1, int(os.environ.get("HIRO_SKILL_CONCURRENCY", "4"))),
@@ -387,14 +451,13 @@ async def scan(
         completed_successfully = True
 
     finally:
-        if completed_successfully:
+        # Always clean up scratchpad to prevent cleartext secret accumulation
+        if scratchpad_dir.exists():
             shutil.rmtree(scratchpad_dir, ignore_errors=True)
-        elif scratchpad_dir.exists():
-            logger.warning(
-                "scratchpad_preserved",
-                path=str(scratchpad_dir),
-                reason="scan_failed_or_aborted",
-            )
+            if completed_successfully:
+                logger.info("scratchpad_cleaned_up", reason="scan_completed")
+            else:
+                logger.info("scratchpad_cleaned_up", reason="scan_failed_or_aborted")
 
 
 def main() -> None:
