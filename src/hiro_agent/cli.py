@@ -31,6 +31,8 @@ def _configure_file_logging() -> str:
     log_path = log_dir / f"hiro-{ts}.log"
 
     log_file = open(log_path, "w")  # noqa: SIM115 — closed on process exit
+    # Set restrictive permissions (0o600) to protect debug output
+    os.chmod(log_path, 0o600)
 
     structlog.configure(
         processors=[
