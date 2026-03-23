@@ -59,6 +59,7 @@ def _ensure_gitignore(project_root: Path) -> None:
         ".hiro/.scan_index.json",
         ".hiro/logs/",
         ".hiro/config.json",
+        ".mcp.json",
     ]
 
     if gitignore.exists():
@@ -76,6 +77,38 @@ def _ensure_gitignore(project_root: Path) -> None:
 
     if added:
         gitignore.write_text(content)
+
+
+def _warn_if_tracked(project_root: Path) -> None:
+    """Warn if sensitive files are already tracked by git."""
+    import subprocess
+
+    sensitive_files = [".mcp.json", ".hiro/config.json"]
+
+    for filename in sensitive_files:
+        file_path = project_root / filename
+        if not file_path.exists():
+            continue
+
+        try:
+            # Check if file is tracked by git
+            result = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", filename],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            # If exit code is 0, the file is tracked
+            if result.returncode == 0:
+                click.echo(f"⚠️  WARNING: {filename} is already tracked by git!", err=True)
+                click.echo(f"   This file contains sensitive data (API keys).", err=True)
+                click.echo(f"   Adding it to .gitignore won't remove it from git history.", err=True)
+                click.echo(f"   Run: git rm --cached {filename}", err=True)
+                click.echo()
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            # Not in a git repo, git not available, or other error - skip silently
+            pass
 
 
 def _install_hooks(project_root: Path) -> None:
@@ -467,6 +500,7 @@ def _run_hook_update(project_root: Path, tool_filter: str | None = None) -> None
     _install_hooks(project_root)
     _ensure_state_dir(project_root)
     _ensure_gitignore(project_root)
+    _warn_if_tracked(project_root)
     click.echo()
 
     if tool_filter:
