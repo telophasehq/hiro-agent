@@ -19,6 +19,31 @@ def _silence_logs() -> None:
     )
 
 
+_SENSITIVE_KEYS = frozenset({
+    'diff', 'response_body', 'authorization', 'api_key', 'token',
+    'secret', 'password', 'credential', 'bearer', 'key',
+})
+_MAX_VALUE_LENGTH = 500
+_MAX_LOG_FILES = 10
+
+
+def _scrub_sensitive_fields(logger, method_name, event_dict):
+    """Scrub sensitive fields from log events."""
+    for key in list(event_dict.keys()):
+        if key in _SENSITIVE_KEYS:
+            event_dict[key] = '[REDACTED]'
+        elif isinstance(event_dict[key], str) and len(event_dict[key]) > _MAX_VALUE_LENGTH:
+            event_dict[key] = event_dict[key][:_MAX_VALUE_LENGTH] + '… [truncated]'
+    return event_dict
+
+
+def _rotate_logs(log_dir: Path) -> None:
+    """Delete old log files, keeping only the most recent ones."""
+    logs = sorted(log_dir.glob("hiro-*.log"), key=lambda p: p.stat().st_mtime)
+    for old in logs[:-_MAX_LOG_FILES]:
+        old.unlink(missing_ok=True)
+
+
 def _configure_file_logging() -> str:
     """Route structlog to a timestamped log file. Returns the log file path.
 
@@ -27,6 +52,7 @@ def _configure_file_logging() -> str:
     """
     log_dir = Path(".hiro") / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    _rotate_logs(log_dir)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = log_dir / f"hiro-{ts}.log"
 
@@ -36,6 +62,7 @@ def _configure_file_logging() -> str:
         processors=[
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
+            _scrub_sensitive_fields,
             structlog.dev.ConsoleRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG),
