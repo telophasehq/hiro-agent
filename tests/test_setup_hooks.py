@@ -20,6 +20,7 @@ from hiro_agent.setup_hooks import (
     _setup_cursor,
     _setup_git_precommit,
     _setup_vscode,
+    _warn_if_tracked,
     run_verify,
 )
 
@@ -71,6 +72,7 @@ class TestEnsureGitignore:
         content = gitignore.read_text()
         assert ".hiro/.state/" in content
         assert ".hiro/config.json" in content
+        assert ".mcp.json" in content
 
     def test_appends_to_existing_gitignore(self, tmp_path: Path):
         gitignore = tmp_path / ".gitignore"
@@ -80,6 +82,7 @@ class TestEnsureGitignore:
         assert "node_modules/" in content
         assert ".hiro/.state/" in content
         assert ".hiro/config.json" in content
+        assert ".mcp.json" in content
 
     def test_idempotent(self, tmp_path: Path):
         _ensure_gitignore(tmp_path)
@@ -87,6 +90,118 @@ class TestEnsureGitignore:
         content = (tmp_path / ".gitignore").read_text()
         assert content.count(".hiro/.state/") == 1
         assert content.count(".hiro/config.json") == 1
+        assert content.count(".mcp.json") == 1
+
+
+class TestWarnIfTracked:
+    """Test warning for already-tracked sensitive files."""
+
+    def test_warns_when_mcp_json_is_tracked(self, tmp_path: Path, capsys):
+        # Create .mcp.json
+        (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}')
+
+        # Mock subprocess.run to simulate git ls-files finding the file
+        import subprocess
+        from unittest.mock import Mock
+
+        original_run = subprocess.run
+
+        def mock_run(cmd, **kwargs):
+            if "git" in cmd and "ls-files" in cmd and ".mcp.json" in cmd:
+                # Return success (file is tracked)
+                result = Mock()
+                result.returncode = 0
+                result.stdout = ".mcp.json\n"
+                result.stderr = ""
+                return result
+            return original_run(cmd, **kwargs)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            _warn_if_tracked(tmp_path)
+
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.err
+        assert ".mcp.json" in captured.err
+        assert "git rm --cached" in captured.err
+
+    def test_warns_when_config_json_is_tracked(self, tmp_path: Path, capsys):
+        # Create .hiro/config.json
+        (tmp_path / ".hiro").mkdir()
+        (tmp_path / ".hiro" / "config.json").write_text('{"api_key": "test"}')
+
+        # Mock subprocess.run to simulate git ls-files finding the file
+        import subprocess
+        from unittest.mock import Mock
+
+        original_run = subprocess.run
+
+        def mock_run(cmd, **kwargs):
+            if "git" in cmd and "ls-files" in cmd and ".hiro/config.json" in cmd:
+                # Return success (file is tracked)
+                result = Mock()
+                result.returncode = 0
+                result.stdout = ".hiro/config.json\n"
+                result.stderr = ""
+                return result
+            return original_run(cmd, **kwargs)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            _warn_if_tracked(tmp_path)
+
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.err
+        assert ".hiro/config.json" in captured.err
+        assert "git rm --cached" in captured.err
+
+    def test_no_warning_when_file_not_tracked(self, tmp_path: Path, capsys):
+        # Create .mcp.json
+        (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}')
+
+        # Mock subprocess.run to simulate git ls-files not finding the file
+        import subprocess
+        from unittest.mock import Mock
+
+        def mock_run(cmd, **kwargs):
+            if "git" in cmd and "ls-files" in cmd:
+                # Return error (file not tracked)
+                result = Mock()
+                result.returncode = 1
+                result.stdout = ""
+                result.stderr = "error: pathspec '.mcp.json' did not match any file(s) known to git\n"
+                return result
+            return subprocess.run(cmd, **kwargs)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            _warn_if_tracked(tmp_path)
+
+        captured = capsys.readouterr()
+        assert "WARNING" not in captured.err
+
+    def test_no_warning_when_file_does_not_exist(self, tmp_path: Path, capsys):
+        # Don't create any files
+        _warn_if_tracked(tmp_path)
+
+        captured = capsys.readouterr()
+        assert "WARNING" not in captured.err
+
+    def test_handles_git_not_available(self, tmp_path: Path, capsys):
+        # Create .mcp.json
+        (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}')
+
+        # Mock subprocess.run to raise FileNotFoundError (git not installed)
+        def mock_run(cmd, **kwargs):
+            if "git" in cmd:
+                raise FileNotFoundError("git not found")
+            return subprocess.run(cmd, **kwargs)
+
+        import subprocess
+        with patch("subprocess.run", side_effect=mock_run):
+            # Should not raise, just skip silently
+            _warn_if_tracked(tmp_path)
+
+        captured = capsys.readouterr()
+        # No error should be shown to user
+        assert "WARNING" not in captured.err
 
 
 class TestDetectTools:
