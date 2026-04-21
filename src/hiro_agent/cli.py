@@ -49,7 +49,7 @@ MAX_STDIN_BYTES = 2 * 1024 * 1024
 
 
 def _default_review_output_path(command_name: str) -> str:
-    """Return a durable temp file path for background-safe review output."""
+    """Return a temp file path for review output."""
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = f"hiro-{command_name}-{ts}-{os.getpid()}.md"
     return str(Path(tempfile.gettempdir()) / filename)
@@ -83,7 +83,12 @@ def main() -> None:
 @click.option("--quiet", "-q", is_flag=True, help="Hide tool calls and agent reasoning.")
 @click.option("--output", "-o", "output_file", default=None, type=click.Path(), help="Write review to file. Defaults to a temp file announced before the review starts.")
 def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
-    """Review code changes for security issues. Reads diff from stdin."""
+    """Review code changes for security issues. Reads diff from stdin.
+
+    \b
+    Usage with AI coding tools (Claude Code, Cursor, etc.):
+      git diff | hiro review-code
+    """
     from hiro_agent.review_code import review_code
 
     log_path = _configure_file_logging()
@@ -95,6 +100,8 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
 
     cwd = os.getcwd()
     review_output = output_file or _default_review_output_path("review-code")
+    mirror = sys.stdout.isatty()
+
     click.echo(f"outputting review to {review_output}")
     asyncio.run(
         review_code(
@@ -103,7 +110,7 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
             context=context,
             verbose=not quiet,
             output_file=review_output,
-            mirror_to_stdout=sys.stdout.isatty(),
+            mirror_to_stdout=mirror,
         )
     )
     click.echo(f"\nLog: {log_path}", err=True)
@@ -112,8 +119,14 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
 @main.command("review-plan")
 @click.option("--context", "-c", default="", help="Additional context about the plan.")
 @click.option("--quiet", "-q", is_flag=True, help="Hide tool calls and agent reasoning.")
-def review_plan_cmd(context: str, quiet: bool) -> None:
-    """Review an implementation plan for security concerns. Reads from stdin."""
+@click.option("--output", "-o", "output_file", default=None, type=click.Path(), help="Write review to file. Defaults to a temp file announced before the review starts.")
+def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
+    """Review an implementation plan for security concerns. Reads from stdin.
+
+    \b
+    Usage with AI coding tools (Claude Code, Cursor, etc.):
+      cat plan.md | hiro review-plan
+    """
     from hiro_agent.review_plan import review_plan
 
     log_path = _configure_file_logging()
@@ -124,8 +137,20 @@ def review_plan_cmd(context: str, quiet: bool) -> None:
         raise SystemExit(1)
 
     cwd = os.getcwd()
-    click.echo("Reviewing plan...\n", err=True)
-    asyncio.run(review_plan(plan, cwd=cwd, context=context, verbose=not quiet))
+    review_output = output_file or _default_review_output_path("review-plan")
+    mirror = sys.stdout.isatty()
+
+    click.echo(f"outputting review to {review_output}")
+    asyncio.run(
+        review_plan(
+            plan,
+            cwd=cwd,
+            context=context,
+            verbose=not quiet,
+            output_file=review_output,
+            mirror_to_stdout=mirror,
+        )
+    )
     click.echo(f"\nLog: {log_path}", err=True)
 
 
@@ -159,32 +184,6 @@ def review_infra_cmd(filepath: str | None, output_file: str | None) -> None:
         click.echo(f"Report written to {output_file}", err=True)
     else:
         click.echo(result)
-
-
-@main.command()
-@click.option("--focus", "-f", default="", help="Focus area (e.g., 'auth', 'api', 'crypto').")
-@click.option("--quiet", "-q", is_flag=True, help="Hide tool calls and agent reasoning.")
-@click.option("--output", "-o", "output_file", default=None, type=click.Path(), help="Write report to file instead of stdout.")
-def scan(focus: str, quiet: bool, output_file: str | None) -> None:
-    """Scan the codebase for security issues (experimental)."""
-    from hiro_agent.scan import scan as run_scan
-
-    log_path = _configure_file_logging()
-
-    cwd = os.getcwd()
-    click.echo(
-        "Note: `hiro scan` is experimental and can be slow or incomplete.\n"
-        "Use `hiro review-code` and `hiro review-plan` for primary enforcement.\n",
-        err=True,
-    )
-    if focus:
-        click.echo(f"Scanning {cwd} (focus: {focus})...\n", err=True)
-    else:
-        click.echo(f"Scanning {cwd}...\n", err=True)
-    asyncio.run(run_scan(cwd=cwd, focus=focus, verbose=not quiet, output_file=output_file))
-    if output_file:
-        click.echo(f"Report written to {output_file}", err=True)
-    click.echo(f"\nLog: {log_path}", err=True)
 
 
 @main.command()
@@ -238,3 +237,16 @@ def verify() -> None:
     from hiro_agent.setup_hooks import run_verify
 
     run_verify()
+
+
+@main.command("upload-review")
+def upload_review_cmd() -> None:
+    """Upload pending review reports to the Hiro backend.
+
+    Run automatically by the post-commit git hook installed by `hiro setup`.
+    Always exits 0; failures are logged but never block a commit.
+    """
+    from hiro_agent.upload_review import main as run_upload
+
+    _configure_file_logging()
+    run_upload()

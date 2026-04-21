@@ -141,16 +141,6 @@ def main() -> int:
         _allow()
         return 0
 
-    # --- PreToolUse: enforce correct hiro invocation ---
-    if event == "PreToolUse" and _is_review_command(tool_name, tool_input):
-        cmd = tool_input.get("command", "")
-        if tool_input.get("run_in_background"):
-            _deny(
-                "DENIED: run_in_background is not allowed for hiro commands.\n"
-                "RETRY the same Bash command with run_in_background=false."
-            )
-            return 0
-
     # --- PreToolUse: block git commit if review is pending ---
     if event == "PreToolUse" and tool_name == "Bash":
         command = tool_input.get("command", "")
@@ -164,7 +154,10 @@ def main() -> int:
                 _deny(
                     f"DENIED: {len(files)} file(s) modified since last "
                     f"security review ({file_list}).\n"
-                    "Run this Bash command first: git diff --cached | hiro review-code"
+                    "Run this Bash command first:\n"
+                    "  git diff --cached | hiro review-code\n"
+                    "The command blocks until the review is complete and prints the output file path.\n"
+                    "After it finishes, read the output file for the full review."
                 )
                 return 0
 

@@ -126,7 +126,9 @@ def main() -> int:
                 "DENIED: Hiro security review required before ExitPlanMode.\n\n"
                 "STEP 1: Run the Bash tool with this command:\n"
                 "  cat /path/to/plan.md | hiro review-plan\n"
-                "Replace /path/to/plan.md with the plan file you wrote.\n\n"
+                "Replace /path/to/plan.md with the plan file you wrote.\n"
+                "The command blocks until the review is complete and prints the output file path.\n"
+                "After it finishes, read the output file for the full review.\n\n"
                 "STEP 2: Call ExitPlanMode again — it will be allowed."
             )
             return 0

@@ -55,9 +55,8 @@ def _ensure_gitignore(project_root: Path) -> None:
     gitignore = project_root / ".gitignore"
     entries = [
         ".hiro/.state/",
-        ".hiro/.scratchpad/",
-        ".hiro/.scan_index.json",
         ".hiro/logs/",
+        ".hiro/reviews/",
         ".hiro/config.json",
     ]
 
@@ -307,7 +306,7 @@ for state_file in state_dir.glob("code_review_*.json"):
     if state.get("needs_review"):
         files = state.get("modified_files", [])
         print(f"Commit blocked: {len(files)} file(s) modified since last security review.")
-        print("Run: git diff --cached | hiro review-code --output .hiro/.state/code-review.md")
+        print("Run: git diff --cached | hiro review-code")
         sys.exit(1)
 
 sys.exit(0)
@@ -328,6 +327,57 @@ sys.exit(0)
 
     precommit.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)  # 0755
     click.echo(f"  Installed {precommit}")
+
+
+def _setup_git_postcommit(project_root: Path) -> None:
+    """Install git post-commit hook that uploads pending hiro reviews.
+
+    Best-effort upload — the hook always exits 0 so a network failure or
+    missing API key never disrupts the user's commit flow.
+    """
+    git_dir = project_root / ".git"
+    if not git_dir.is_dir():
+        click.echo("  Skipping git post-commit: not a git repository.")
+        return
+
+    hooks_dir = git_dir / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    postcommit = hooks_dir / "post-commit"
+
+    marker = "# hiro:upload-review"
+    script = f"""\
+#!/usr/bin/env bash
+{marker}
+# Upload pending Hiro review reports to the backend (best-effort, non-blocking).
+hiro upload-review >/dev/null 2>&1 &
+disown 2>/dev/null || true
+exit 0
+"""
+
+    if postcommit.exists():
+        existing = postcommit.read_text()
+        if marker in existing:
+            click.echo("  Git post-commit hook already contains Hiro upload.")
+            return
+        click.echo(
+            "  Warning: existing post-commit hook found. "
+            "Adding Hiro upload as a wrapper."
+        )
+        postcommit.rename(postcommit.with_suffix(".original"))
+        wrapper = (
+            f"#!/usr/bin/env bash\n{marker}\n"
+            "hiro upload-review >/dev/null 2>&1 &\n"
+            "disown 2>/dev/null || true\n"
+            f"exec \"{postcommit.with_suffix('.original')}\" \"$@\"\n"
+        )
+        postcommit.write_text(wrapper)
+    else:
+        postcommit.write_text(script)
+
+    postcommit.chmod(
+        stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+    )  # 0755
+    click.echo(f"  Installed {postcommit}")
 
 
 def _get_claude_desktop_config_path() -> Path | None:
@@ -488,6 +538,9 @@ def _run_hook_update(project_root: Path, tool_filter: str | None = None) -> None
     # Always install git pre-commit as universal fallback
     if "codex" not in tools:  # codex setup already installs it
         _setup_git_precommit(project_root)
+
+    # Always install git post-commit hook for review uploads.
+    _setup_git_postcommit(project_root)
 
 
 def run_setup(tool_filter: str | None = None) -> None:

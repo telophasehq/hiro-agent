@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import tempfile
 import time as _time
 
 import structlog
@@ -10,22 +11,18 @@ import structlog
 from hiro_agent._common import (
     ToolPolicyViolationError,
     _ScanDisplay,
+    _strip_post_report_text,
     get_tool_policy_violation,
-    _run_report_stream,
     _run_tracked_agent,
     prepare_mcp,
 )
 from hiro_agent.prompts import (
     CONTEXT_PREAMBLE,
-    PLAN_INVESTIGATION_SYSTEM_PROMPT,
-    PLAN_RECON_SYSTEM_PROMPT,
-    PLAN_REPORT_SYSTEM_PROMPT,
+    REVIEW_PLAN_SYSTEM_PROMPT,
 )
 from hiro_agent.skills import SKILL_NAMES, load_skill
 
 logger = structlog.get_logger(__name__)
-
-RECON_TOOLS = ["Read", "Grep", "TodoWrite", "TodoRead"]
 
 
 async def review_plan(
@@ -34,13 +31,13 @@ async def review_plan(
     cwd: str | None = None,
     context: str = "",
     verbose: bool = False,
+    output_file: str | None = None,
+    mirror_to_stdout: bool = False,
 ) -> None:
     """Run a single-agent STRIDE threat model review on an implementation plan.
 
-    Three phases:
-      1. Reconnaissance — explore code referenced by the plan (Sonnet, 5 turns)
-      2. Investigation — single Opus agent with all playbook knowledge (10 turns)
-      3. Report — synthesize findings into a STRIDE-framed report
+    One Opus agent reads the plan, explores surrounding code, investigates
+    security implications, and writes the STRIDE report as its final output.
 
     Args:
         plan: The plan text, architecture description, or design document.
@@ -54,88 +51,24 @@ async def review_plan(
 
     logger.info("review_plan_started", cwd=cwd, plan_len=len(plan))
 
-    # Shared MCP setup — called once, reused by all agents
+    # Write plan to a temp file so the agent can Read it instead of
+    # embedding the entire plan in the prompt context window.
+    plan_fd, plan_path = tempfile.mkstemp(suffix=".md", prefix="hiro-plan-")
+    try:
+        os.write(plan_fd, plan.encode())
+    finally:
+        os.close(plan_fd)
+    logger.info("plan_written", path=plan_path, size=len(plan))
+
+    # Shared MCP setup — called once
     mcp_setup = await prepare_mcp(is_tty=is_tty)
 
-    display = _ScanDisplay(["investigation"]) if is_tty else None
+    display = _ScanDisplay(["review"], skip_phases=True) if is_tty else None
 
     try:
-        # -- Phase 1: Reconnaissance ------------------------------------------
-        if display:
-            display.start_recon()
-
-        recon_prompt_parts = [
-            f"Review the following implementation plan from **{repo_name}** ({cwd or '.'}).",
-            "Explore the code it references to understand the security context.",
-            f"\n## Plan\n\n{plan}",
-        ]
-        if context:
-            recon_prompt_parts.append(f"\nAdditional context: {context}")
-
-        def _on_recon_tool(agent_name: str, tool_name: str, summary: str, is_subagent: bool) -> None:
-            if display:
-                display.recon_tool(tool_name, summary)
-
-        def _on_recon_text(text: str) -> None:
-            if display:
-                display.recon_text(text)
-
-        def _on_recon_tool_event(agent_name: str, tool_name: str, tool_input: dict, is_subagent: bool) -> None:
-            violation = get_tool_policy_violation(
-                tool_name=tool_name,
-                tool_input=tool_input,
-            )
-            if violation is not None:
-                blocked_path, reason = violation
-                raise ToolPolicyViolationError(blocked_path, reason, tool_name=tool_name)
-
-        t0 = _time.monotonic()
-        recon = ""
-        recon_prompt = "\n".join(recon_prompt_parts)
-        recon_policy_note = ""
-        for attempt in range(3):
-            try:
-                recon_max_turns = 5
-                recon, _ = await _run_tracked_agent(
-                    name="recon",
-                    prompt=f"{recon_prompt}{recon_policy_note}",
-                    system_prompt=PLAN_RECON_SYSTEM_PROMPT.replace("{max_turns}", str(recon_max_turns)),
-                    cwd=cwd,
-                    allowed_tools=RECON_TOOLS,
-                    mcp_setup=mcp_setup,
-                    max_turns=recon_max_turns,
-                    model="sonnet",
-                    effort="medium",
-                    on_tool=_on_recon_tool,
-                    on_tool_event=_on_recon_tool_event,
-                    on_text=_on_recon_text,
-                )
-                break
-            except ToolPolicyViolationError as exc:
-                logger.warning(
-                    "plan_recon_policy_violation",
-                    attempt=attempt + 1,
-                    tool=exc.tool_name,
-                    path=exc.path,
-                    reason=exc.reason,
-                )
-                if attempt == 2:
-                    raise
-                recon_policy_note = (
-                    "\n\n## Enforced Tool Policy\n"
-                    "- Do not search `.venv`, `node_modules`, `vendor`, `dist`, or other ignored directories.\n"
-                    "- For `Grep`/`Glob`, always scope to first-party paths (for example: `src`, `app`, "
-                    "`backend`, `frontend`, `services`, `tests`).\n"
-                    "- Repo-root recursive searches are blocked.\n"
-                )
-        logger.info("phase_completed", phase="recon", duration_s=round(_time.monotonic() - t0, 1))
-
-        # -- Phase 2: Investigation (single agent, bundled playbooks) ----------
         if display:
             display.start_investigations()
-            display.agent_started("investigation")
-
-        t0 = _time.monotonic()
+            display.agent_started("review")
 
         # Bundle all playbooks into the system prompt
         all_playbooks = "\n\n".join(
@@ -143,25 +76,22 @@ async def review_plan(
             for name in SKILL_NAMES
         )
 
-        investigation_max_turns = 10
-        investigation_system = PLAN_INVESTIGATION_SYSTEM_PROMPT.format(
+        system = REVIEW_PLAN_SYSTEM_PROMPT.format(
             context_preamble=CONTEXT_PREAMBLE,
             all_playbooks=all_playbooks,
-            max_turns=investigation_max_turns,
         )
 
-        investigation_prompt_parts = [
-            f"## Plan Under Review\n\n{plan}",
-            f"\n## Codebase Context\n\n{recon}",
+        prompt_parts = [
+            f"Review the plan at `{plan_path}` from {repo_name}.",
         ]
         if context:
-            investigation_prompt_parts.append(f"\nAdditional context: {context}")
+            prompt_parts.append(f"\nAdditional context: {context}")
 
-        def _on_investigation_tool(agent_name: str, tool_name: str, summary: str, is_subagent: bool) -> None:
+        def _on_tool(agent_name: str, tool_name: str, summary: str, is_subagent: bool) -> None:
             if display:
                 display.agent_tool(agent_name, tool_name, summary, is_subagent)
 
-        def _on_investigation_tool_event(agent_name: str, tool_name: str, tool_input: dict, is_subagent: bool) -> None:
+        def _on_tool_event(agent_name: str, tool_name: str, tool_input: dict, is_subagent: bool) -> None:
             violation = get_tool_policy_violation(
                 tool_name=tool_name,
                 tool_input=tool_input,
@@ -170,60 +100,72 @@ async def review_plan(
                 blocked_path, reason = violation
                 raise ToolPolicyViolationError(blocked_path, reason, tool_name=tool_name)
 
-        investigation_output, _ = await _run_tracked_agent(
-            name="investigation",
-            prompt="\n".join(investigation_prompt_parts),
-            system_prompt=investigation_system,
-            cwd=cwd,
-            allowed_tools=["Read", "Grep"],
-            mcp_setup=mcp_setup,
-            max_turns=investigation_max_turns,
-            model="opus",
-            thinking_budget=30_000,
-            on_tool=_on_investigation_tool,
-            on_tool_event=_on_investigation_tool_event,
-        )
+        policy_note = ""
+        for attempt in range(3):
+            try:
+                output, _ = await _run_tracked_agent(
+                    name="review",
+                    prompt="\n".join(prompt_parts) + policy_note,
+                    system_prompt=system,
+                    cwd=cwd,
+                    allowed_tools=["Read", "Grep"],
+                    mcp_setup=mcp_setup,
+                    max_turns=30,
+                    model="opus",
+                    thinking_budget=30_000,
+                    on_tool=_on_tool,
+                    on_tool_event=_on_tool_event,
+                )
+                break
+            except ToolPolicyViolationError as exc:
+                logger.warning(
+                    "review_plan_policy_violation",
+                    attempt=attempt + 1,
+                    tool=exc.tool_name,
+                    path=exc.path,
+                    reason=exc.reason,
+                )
+                if attempt == 2:
+                    raise
+                policy_note = (
+                    "\n\n## Enforced Tool Policy\n"
+                    "- Do not read or search inside `.git/` directories.\n"
+                    "- Do not search `.venv`, `node_modules`, `vendor`, `dist`, or other ignored directories.\n"
+                    "- For `Grep`/`Glob`, always scope to first-party paths (for example: `src`, `app`, "
+                    "`backend`, `frontend`, `services`, `tests`).\n"
+                    "- Repo-root recursive searches are blocked.\n"
+                )
 
         if display:
-            display.agent_completed("investigation")
+            display.agent_completed("review")
 
-        logger.info(
-            "phase_completed",
-            phase="investigation",
-            duration_s=round(_time.monotonic() - t0, 1),
-        )
-
-        # -- Phase 3: Report (streaming) --------------------------------------
-        if display:
-            display.start_report()
-
-        t0 = _time.monotonic()
-        report_prompt = (
-            f"## Plan Under Review\n\n{plan}\n\n"
-            f"## Investigation Findings\n\n{investigation_output}\n\n"
-            "Synthesize the above into a final STRIDE security report for this plan."
-        )
-
-        await _run_report_stream(
-            prompt=report_prompt,
-            system_prompt=PLAN_REPORT_SYSTEM_PROMPT,
-            mcp_setup=mcp_setup,
-            model="opus",
-            is_tty=is_tty,
-            output_file=None,
-        )
-        logger.info("phase_completed", phase="report", duration_s=round(_time.monotonic() - t0, 1))
-
-        if display:
-            display.finish()
+        # Strip trailing narration (safety net)
+        output = _strip_post_report_text(output)
 
         logger.info(
             "review_plan_completed",
             total_s=round(_time.monotonic() - review_start, 1),
         )
 
+        if display:
+            display.start_report()
+
+        # Write output
+        if output.strip():
+            out_fh = open(output_file, "w") if output_file else None  # noqa: SIM115
+            if out_fh:
+                out_fh.write(output + "\n")
+                out_fh.flush()
+                out_fh.close()
+            if not out_fh or mirror_to_stdout:
+                print(output, flush=True)
+
     finally:
-        pass
+        # Clean up the temp plan file.
+        try:
+            os.unlink(plan_path)
+        except OSError:
+            pass
 
 
 def main() -> None:
