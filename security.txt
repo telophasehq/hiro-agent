@@ -1,0 +1,5 @@
+Contact: mailto:security@hiro.is
+Expires: 2027-03-25T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://hiro.is/.well-known/security.txt
+Policy: https://github.com/telophasehq/hiro-agent/blob/main/SECURITY.md
