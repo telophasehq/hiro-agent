@@ -21,121 +21,41 @@ class TestReviewPlan:
         return str(tmp_path)
 
     @pytest.mark.asyncio
-    async def test_plan_passed_to_recon(self, mock_mcp_setup, tmp_cwd):
-        """Plan text should appear in the recon agent prompt."""
-        captured_prompts = {}
+    async def test_plan_written_to_tempfile_and_path_in_prompt(self, mock_mcp_setup, tmp_cwd):
+        """Plan is written to a temp .md file; the prompt references that path."""
+        captured = {}
 
         async def mock_tracked(*, name, prompt, **kwargs):
-            captured_prompts[name] = prompt
-            return ("recon output", "sess")
+            captured["name"] = name
+            captured["prompt"] = prompt
+            return ("Stride report body", "sess")
 
         with (
             patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
         ):
-            await review_plan("SECRET_PLAN_TEXT", cwd=tmp_cwd)
+            await review_plan("Proposed payment module design", cwd=tmp_cwd)
 
-        assert "SECRET_PLAN_TEXT" in captured_prompts["recon"]
-
-    @pytest.mark.asyncio
-    async def test_plan_passed_to_investigation(self, mock_mcp_setup, tmp_cwd):
-        """Plan text should appear in the investigation agent prompt."""
-        captured_prompts = {}
-
-        async def mock_tracked(*, name, prompt, **kwargs):
-            captured_prompts[name] = prompt
-            return ("output", "sess")
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
-        ):
-            await review_plan("UNIQUE_PLAN_TOKEN", cwd=tmp_cwd)
-
-        assert "UNIQUE_PLAN_TOKEN" in captured_prompts["investigation"]
-
-    @pytest.mark.asyncio
-    async def test_recon_passed_to_investigation(self, mock_mcp_setup, tmp_cwd):
-        """Recon output should appear in the investigation agent prompt."""
-        captured_prompts = {}
-
-        async def mock_tracked(*, name, prompt, **kwargs):
-            captured_prompts[name] = prompt
-            if name == "recon":
-                return ("RECON_DATA_XYZ", "sess-recon")
-            return ("output", "sess")
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
-        ):
-            await review_plan("some plan", cwd=tmp_cwd)
-
-        assert "RECON_DATA_XYZ" in captured_prompts["investigation"]
+        assert captured["name"] == "review"
+        assert "hiro-plan-" in captured["prompt"]
+        assert ".md" in captured["prompt"]
 
     @pytest.mark.asyncio
     async def test_context_passed_through(self, mock_mcp_setup, tmp_cwd):
-        """Context string should appear in recon and investigation prompts."""
-        captured_prompts = {}
+        """Context string should appear in the agent prompt."""
+        captured = {}
 
         async def mock_tracked(*, name, prompt, **kwargs):
-            captured_prompts[name] = prompt
+            captured["prompt"] = prompt
             return ("output", "sess")
 
         with (
             patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
         ):
-            await review_plan("plan", cwd=tmp_cwd, context="This is an auth module")
+            await review_plan("plan", cwd=tmp_cwd, context="Public-facing payment API")
 
-        assert "This is an auth module" in captured_prompts["recon"]
-        assert "This is an auth module" in captured_prompts["investigation"]
-
-    @pytest.mark.asyncio
-    async def test_report_gets_investigation_output(self, mock_mcp_setup, tmp_cwd):
-        """Report phase should receive investigation output."""
-        captured_report = {}
-
-        async def mock_tracked(*, name, **kwargs):
-            if name == "investigation":
-                return ("INVESTIGATION_FINDINGS_HERE", "sess")
-            return ("recon", "sess")
-
-        async def mock_report(*, prompt, **kwargs):
-            captured_report["prompt"] = prompt
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", side_effect=mock_report),
-        ):
-            await review_plan("plan", cwd=tmp_cwd)
-
-        assert "INVESTIGATION_FINDINGS_HERE" in captured_report["prompt"]
-
-    @pytest.mark.asyncio
-    async def test_report_includes_plan(self, mock_mcp_setup, tmp_cwd):
-        """Report prompt should include the original plan text."""
-        captured_report = {}
-
-        async def mock_tracked(*, name, **kwargs):
-            return ("output", "sess")
-
-        async def mock_report(*, prompt, **kwargs):
-            captured_report["prompt"] = prompt
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", side_effect=mock_report),
-        ):
-            await review_plan("REPORT_PLAN_MARKER", cwd=tmp_cwd)
-
-        assert "REPORT_PLAN_MARKER" in captured_report["prompt"]
+        assert "Public-facing payment API" in captured["prompt"]
 
     @pytest.mark.asyncio
     async def test_mcp_called_once(self, mock_mcp_setup, tmp_cwd):
@@ -148,105 +68,40 @@ class TestReviewPlan:
         with (
             patch("hiro_agent.review_plan.prepare_mcp", mock_prepare),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
         ):
             await review_plan("plan", cwd=tmp_cwd)
 
         mock_prepare.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_recon_uses_plan_prompt(self, mock_mcp_setup, tmp_cwd):
-        """Recon should use PLAN_RECON_SYSTEM_PROMPT, not DIFF_RECON_SYSTEM_PROMPT."""
-        captured_recon = {}
-
-        async def mock_tracked(*, name, system_prompt, **kwargs):
-            if name == "recon":
-                captured_recon["system_prompt"] = system_prompt
-            return ("output", "sess")
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
-        ):
-            await review_plan("plan", cwd=tmp_cwd)
-
-        assert "implementation plan" in captured_recon["system_prompt"]
-        assert "Plan Overview" in captured_recon["system_prompt"]
-
-    @pytest.mark.asyncio
-    async def test_report_uses_plan_report_prompt(self, mock_mcp_setup, tmp_cwd):
-        """Report should use PLAN_REPORT_SYSTEM_PROMPT with STRIDE framing."""
-        captured_report = {}
-
-        async def mock_tracked(*, name, **kwargs):
-            return ("output", "sess")
-
-        async def mock_report(*, system_prompt, **kwargs):
-            captured_report["system_prompt"] = system_prompt
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", side_effect=mock_report),
-        ):
-            await review_plan("plan", cwd=tmp_cwd)
-
-        assert "STRIDE" in captured_report["system_prompt"]
-        assert "Recommended Controls" in captured_report["system_prompt"]
-
-    @pytest.mark.asyncio
-    async def test_recon_model_is_sonnet(self, mock_mcp_setup, tmp_cwd):
-        """Recon phase should use sonnet model."""
+    async def test_model_is_opus(self, mock_mcp_setup, tmp_cwd):
+        """The review agent should use opus."""
         captured = {}
 
         async def mock_tracked(*, name, model, **kwargs):
-            if name == "recon":
-                captured["model"] = model
+            captured["model"] = model
             return ("output", "sess")
 
         with (
             patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
-        ):
-            await review_plan("plan", cwd=tmp_cwd)
-
-        assert captured["model"] == "sonnet"
-
-    @pytest.mark.asyncio
-    async def test_investigation_model_is_opus(self, mock_mcp_setup, tmp_cwd):
-        """Investigation phase should use opus model."""
-        captured = {}
-
-        async def mock_tracked(*, name, model, **kwargs):
-            if name == "investigation":
-                captured["model"] = model
-            return ("output", "sess")
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
         ):
             await review_plan("plan", cwd=tmp_cwd)
 
         assert captured["model"] == "opus"
 
     @pytest.mark.asyncio
-    async def test_investigation_has_read_grep(self, mock_mcp_setup, tmp_cwd):
-        """Investigation agent should have Read and Grep tools."""
+    async def test_allowed_tools_read_grep(self, mock_mcp_setup, tmp_cwd):
+        """Review agent should have Read and Grep available."""
         captured = {}
 
         async def mock_tracked(*, name, allowed_tools=None, **kwargs):
-            if name == "investigation":
-                captured["allowed_tools"] = allowed_tools
+            captured["allowed_tools"] = allowed_tools
             return ("output", "sess")
 
         with (
             patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
         ):
             await review_plan("plan", cwd=tmp_cwd)
 
@@ -254,115 +109,84 @@ class TestReviewPlan:
         assert "Grep" in captured["allowed_tools"]
 
     @pytest.mark.asyncio
-    async def test_investigation_system_prompt_has_playbooks(self, mock_mcp_setup, tmp_cwd):
-        """Investigation system prompt should include content from all skill playbooks."""
+    async def test_system_prompt_has_all_playbooks(self, mock_mcp_setup, tmp_cwd):
+        """System prompt should include a section title for every skill playbook."""
         captured = {}
 
         async def mock_tracked(*, name, system_prompt=None, **kwargs):
-            if name == "investigation":
-                captured["system_prompt"] = system_prompt
+            captured["system_prompt"] = system_prompt
             return ("output", "sess")
 
         with (
             patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
         ):
             await review_plan("plan", cwd=tmp_cwd)
 
         system = captured["system_prompt"]
-        # Should contain section headers for all skills
-        for name in SKILL_NAMES:
-            title = name.replace("-", " ").title()
-            assert title in system, f"Missing playbook section for {name}"
+        for skill_name in SKILL_NAMES:
+            title = skill_name.replace("-", " ").title()
+            assert title in system, f"Missing playbook section for {skill_name}"
 
     @pytest.mark.asyncio
-    async def test_investigation_max_turns_is_10(self, mock_mcp_setup, tmp_cwd):
-        """Investigation agent should have 10 turns."""
+    async def test_max_turns_is_30(self, mock_mcp_setup, tmp_cwd):
+        """Review agent is given a 30-turn budget."""
         captured = {}
 
-        async def mock_tracked(*, name, max_turns=None, system_prompt=None, **kwargs):
-            if name == "investigation":
-                captured["max_turns"] = max_turns
-                captured["system_prompt"] = system_prompt
+        async def mock_tracked(*, name, max_turns=None, **kwargs):
+            captured["max_turns"] = max_turns
             return ("output", "sess")
 
         with (
             patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
         ):
             await review_plan("plan", cwd=tmp_cwd)
 
-        assert captured["max_turns"] == 10
-        assert "10 turns" in captured["system_prompt"]
+        assert captured["max_turns"] == 30
 
     @pytest.mark.asyncio
-    async def test_recon_max_turns_is_5(self, mock_mcp_setup, tmp_cwd):
-        """Recon should use 5 turn budget for plan review."""
-        captured = {}
-
-        async def mock_tracked(*, name, max_turns, system_prompt, **kwargs):
-            if name == "recon":
-                captured["max_turns"] = max_turns
-                captured["system_prompt"] = system_prompt
-            return ("output", "sess")
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
-        ):
-            await review_plan("plan", cwd=tmp_cwd)
-
-        assert captured["max_turns"] == 5
-        assert "5 turns" in captured["system_prompt"]
-
-    @pytest.mark.asyncio
-    async def test_report_model_is_opus(self, mock_mcp_setup, tmp_cwd):
-        """Report phase should use opus model."""
-        captured = {}
-
+    async def test_output_written_to_file(self, mock_mcp_setup, tmp_cwd, tmp_path):
+        """When output_file is given, the report text is written there."""
         async def mock_tracked(*, name, **kwargs):
-            return ("output", "sess")
+            return ("### Security Considerations\nLooks okay.", "sess")
 
-        async def mock_report(*, model, **kwargs):
-            captured["model"] = model
+        out = tmp_path / "plan_report.md"
+        with (
+            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
+            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
+        ):
+            await review_plan("plan", cwd=tmp_cwd, output_file=str(out))
+
+        assert out.exists()
+        assert "Security Considerations" in out.read_text()
+
+    @pytest.mark.asyncio
+    async def test_policy_violation_retries(self, mock_mcp_setup, tmp_cwd):
+        """A ToolPolicyViolationError should trigger a retry with a policy note."""
+        calls = {"n": 0, "prompts": []}
+
+        async def mock_tracked(*, name, prompt, **kwargs):
+            calls["n"] += 1
+            calls["prompts"].append(prompt)
+            if calls["n"] == 1:
+                raise ToolPolicyViolationError(
+                    "**/*.py", "Glob must target a first-party subpath", tool_name="Glob"
+                )
+            return ("output", "sess")
 
         with (
             patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", side_effect=mock_report),
         ):
             await review_plan("plan", cwd=tmp_cwd)
 
-        assert captured["model"] == "opus"
+        assert calls["n"] == 2
+        assert "Enforced Tool Policy" in calls["prompts"][1]
 
     @pytest.mark.asyncio
-    async def test_plan_recon_policy_violation_retries(self, mock_mcp_setup, tmp_cwd):
-        """Plan recon should retry when tool policy blocks an unscoped search."""
-        calls = {"recon": 0}
-
-        async def mock_tracked(*, name, **kwargs):
-            if name == "recon":
-                calls["recon"] += 1
-                if calls["recon"] == 1:
-                    raise ToolPolicyViolationError("**/*.py", "Glob must target a first-party subpath", tool_name="Glob")
-                return ("recon summary", "sess-recon")
-            return ("output", "sess")
-
-        with (
-            patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
-            patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
-        ):
-            await review_plan("plan", cwd=tmp_cwd)
-
-        assert calls["recon"] == 2
-
-    @pytest.mark.asyncio
-    async def test_only_two_tracked_agent_calls(self, mock_mcp_setup, tmp_cwd):
-        """Pipeline should call _run_tracked_agent exactly twice: recon + investigation."""
+    async def test_single_tracked_agent_call(self, mock_mcp_setup, tmp_cwd):
+        """The refactored flow uses a single agent (no recon/investigation split)."""
         call_names = []
 
         async def mock_tracked(*, name, **kwargs):
@@ -372,8 +196,7 @@ class TestReviewPlan:
         with (
             patch("hiro_agent.review_plan.prepare_mcp", return_value=mock_mcp_setup),
             patch("hiro_agent.review_plan._run_tracked_agent", side_effect=mock_tracked),
-            patch("hiro_agent.review_plan._run_report_stream", return_value=None),
         ):
             await review_plan("plan", cwd=tmp_cwd)
 
-        assert call_names == ["recon", "investigation"]
+        assert call_names == ["review"]
