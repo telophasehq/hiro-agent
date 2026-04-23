@@ -43,7 +43,7 @@ logger = structlog.get_logger(__name__)
 # Hardcoded — not configurable to prevent SSRF. HTTPS enforced.
 HIRO_MCP_URL = "https://api.hiro.is/mcp/architect/mcp"
 HIRO_INTERNAL_MCP_URL = "https://api.hiro.is/mcp/architect/internal/mcp"
-HIRO_NOTIFICATIONS_MCP_URL = "https://api.hiro.is/mcp/notifications/mcp"
+HIRO_AGENTS_MCP_URL = "https://api.hiro.is/mcp/agents/mcp"
 HIRO_BACKEND_URL = "https://api.hiro.is"
 
 _EXPLORE_AGENT = AgentDefinition(
@@ -319,8 +319,8 @@ def _get_agent_env() -> dict[str, str]:
     """Build env vars for the agent subprocess.
 
     When a Hiro API key is available, route LLM calls through the Hiro
-    backend proxy to Bedrock (keeps source code within AWS infrastructure).
-    Otherwise the agent uses the developer's ANTHROPIC_API_KEY directly.
+    backend proxy to Bedrock (billing attribution, audit, provider
+    swapping). Otherwise fall back to the Claude CLI's own auth.
     """
     env: dict[str, str] = {"CLAUDECODE": ""}
     api_key = _get_api_key()
@@ -1212,11 +1212,27 @@ async def _run_tracked_agent(
         _heartbeat[0] = _time.monotonic()
         logger.debug("cli_stderr", agent=name, line=line.rstrip())
 
-    _thinking_config = (
-        {"type": "enabled", "budget_tokens": thinking_budget}
-        if thinking_budget is not None
-        else None
-    )
+    # Opus 4.7 on Bedrock rejects ``thinking.type = enabled`` — it requires
+    # ``adaptive`` with a companion ``output_config.effort``. Pre-4.7 models
+    # accepted ``enabled`` with an explicit budget. Use adaptive uniformly
+    # for Opus and map ``thinking_budget`` to the effort bucket; non-Opus
+    # models still get the legacy shape so their behaviour is unchanged.
+    if thinking_budget is None:
+        _thinking_config = None
+    elif model == "opus":
+        _thinking_config = {"type": "adaptive"}
+        if not effort:
+            # Translate a rough budget → effort bucket. These thresholds
+            # mirror what the CLI used to spend at the corresponding
+            # max_thinking_tokens on 4.6.
+            if thinking_budget >= 24_000:
+                effort = "high"
+            elif thinking_budget >= 8_000:
+                effort = "medium"
+            else:
+                effort = "low"
+    else:
+        _thinking_config = {"type": "enabled", "budget_tokens": thinking_budget}
     # Block MCP tools that internally call LLMs (Bedrock Opus) to prevent
     # nested Opus-calling-Opus loops that can run for 60+ minutes.
     _disallowed_mcp_tools = [

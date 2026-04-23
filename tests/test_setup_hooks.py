@@ -284,11 +284,14 @@ class TestSetupClaudeCode:
         assert mcp_file.exists()
         config = json.loads(mcp_file.read_text())
         assert "hiro" in config["mcpServers"]
-        assert "hiro-findings" in config["mcpServers"]
+        assert "hiro-agents" in config["mcpServers"]
+        assert "hiro-findings" not in config["mcpServers"]
         assert config["mcpServers"]["hiro"]["type"] == "http"
         assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
-        assert config["mcpServers"]["hiro-findings"]["url"] == "https://api.hiro.is/mcp/notifications/mcp"
+        assert config["mcpServers"]["hiro-agents"]["url"] == "https://api.hiro.is/mcp/agents/mcp"
+        assert config["mcpServers"]["hiro-agents"]["type"] == "http"
         assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer test-key"
+        assert config["mcpServers"]["hiro-agents"]["headers"]["Authorization"] == "Bearer test-key"
 
     def test_mcp_json_preserves_existing_servers(self, tmp_path: Path):
         (tmp_path / ".hiro").mkdir()
@@ -304,7 +307,21 @@ class TestSetupClaudeCode:
         config = json.loads((tmp_path / ".mcp.json").read_text())
         assert "my-custom-server" in config["mcpServers"]
         assert "hiro" in config["mcpServers"]
-        assert "hiro-findings" in config["mcpServers"]
+        assert "hiro-agents" in config["mcpServers"]
+
+    def test_mcp_json_removes_stale_hiro_findings(self, tmp_path: Path):
+        (tmp_path / ".hiro").mkdir()
+        (tmp_path / ".hiro" / "config.json").write_text(json.dumps({"api_key": "test-key"}))
+        (tmp_path / ".mcp.json").write_text(json.dumps({
+            "mcpServers": {
+                "hiro-findings": {"type": "http", "url": "https://api.hiro.is/mcp/notifications/mcp"},
+            }
+        }))
+
+        _setup_claude_code(tmp_path)
+
+        config = json.loads((tmp_path / ".mcp.json").read_text())
+        assert "hiro-findings" not in config["mcpServers"]
 
     def test_skips_mcp_json_without_api_key(self, tmp_path: Path):
         with patch.dict(os.environ, {}, clear=False):
@@ -362,11 +379,12 @@ class TestSetupClaudeDesktop:
         config = json.loads(config_path.read_text())
         assert "mcpServers" in config
         assert "hiro" in config["mcpServers"]
-        assert "hiro-findings" in config["mcpServers"]
+        assert "hiro-agents" in config["mcpServers"]
+        assert "hiro-findings" not in config["mcpServers"]
         assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
-        assert config["mcpServers"]["hiro-findings"]["url"] == "https://api.hiro.is/mcp/notifications/mcp"
+        assert config["mcpServers"]["hiro-agents"]["url"] == "https://api.hiro.is/mcp/agents/mcp"
         assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer test-key-123"
-        assert config["mcpServers"]["hiro-findings"]["headers"]["Authorization"] == "Bearer test-key-123"
+        assert config["mcpServers"]["hiro-agents"]["headers"]["Authorization"] == "Bearer test-key-123"
 
     def test_preserves_existing_mcp_servers(self, tmp_path: Path):
         config_path = tmp_path / "Claude" / "claude_desktop_config.json"
@@ -385,6 +403,23 @@ class TestSetupClaudeDesktop:
         config = json.loads(config_path.read_text())
         assert "other-tool" in config["mcpServers"]
         assert "hiro" in config["mcpServers"]
+
+    def test_removes_stale_hiro_findings(self, tmp_path: Path):
+        config_path = tmp_path / "Claude" / "claude_desktop_config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({
+            "mcpServers": {
+                "hiro-findings": {"url": "https://api.hiro.is/mcp/notifications/mcp"},
+            }
+        }))
+        (tmp_path / ".hiro").mkdir()
+        (tmp_path / ".hiro" / "config.json").write_text(json.dumps({"api_key": "test-key"}))
+
+        with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=config_path):
+            _setup_claude_desktop(tmp_path)
+
+        config = json.loads(config_path.read_text())
+        assert "hiro-findings" not in config["mcpServers"]
 
     def test_skips_when_no_api_key(self, tmp_path: Path):
         config_path = tmp_path / "Claude" / "claude_desktop_config.json"
