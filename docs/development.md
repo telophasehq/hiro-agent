@@ -20,13 +20,7 @@ uv run pytest -q
 Release-gating tests (primary):
 
 ```bash
-uv run pytest tests/test_review_code.py tests/test_review_plan.py tests/test_cli.py -q
-```
-
-Experimental scan tests (non-blocking by policy):
-
-```bash
-uv run pytest tests/test_scan.py tests/test_common.py -q
+uv run pytest tests/test_review_code.py tests/test_review_plan.py tests/test_cli.py tests/test_common.py -q
 ```
 
 ## Local CLI

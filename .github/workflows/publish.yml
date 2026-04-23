@@ -14,15 +14,6 @@ jobs:
       - run: uv venv && uv pip install -e ".[dev]"
       - run: .venv/bin/pytest -q tests/test_review_code.py tests/test_review_plan.py tests/test_cli.py tests/test_common.py
 
-  test-scan-experimental:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - run: uv venv && uv pip install -e ".[dev]"
-      - run: .venv/bin/pytest -q tests/test_scan.py
-
   publish:
     needs: test-core
     runs-on: ubuntu-latest

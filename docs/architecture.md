@@ -68,4 +68,4 @@ To add a new skill:
 
 1. Add a skill markdown file under `src/hiro_agent/skills/`.
 2. Register it in `src/hiro_agent/skills/__init__.py`.
-3. Add/adjust tests in `tests/test_scan.py` and `tests/test_common.py`.
+3. Add/adjust tests in `tests/test_common.py`.
