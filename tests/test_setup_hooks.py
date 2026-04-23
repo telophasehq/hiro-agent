@@ -14,12 +14,13 @@ from hiro_agent.setup_hooks import (
     _get_claude_desktop_config_path,
     _get_package_hook_content,
     _install_hooks,
-    _resolve_api_key,
+    _persist_api_key_in_shell,
     _setup_claude_code,
     _setup_claude_desktop,
     _setup_cursor,
     _setup_git_precommit,
     _setup_vscode,
+    _shell_profile_path,
     _warn_if_tracked,
     run_verify,
 )
@@ -290,8 +291,8 @@ class TestSetupClaudeCode:
         assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
         assert config["mcpServers"]["hiro-agents"]["url"] == "https://api.hiro.is/mcp/agents/mcp"
         assert config["mcpServers"]["hiro-agents"]["type"] == "http"
-        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer test-key"
-        assert config["mcpServers"]["hiro-agents"]["headers"]["Authorization"] == "Bearer test-key"
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
+        assert config["mcpServers"]["hiro-agents"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
 
     def test_mcp_json_preserves_existing_servers(self, tmp_path: Path):
         (tmp_path / ".hiro").mkdir()
@@ -323,12 +324,14 @@ class TestSetupClaudeCode:
         config = json.loads((tmp_path / ".mcp.json").read_text())
         assert "hiro-findings" not in config["mcpServers"]
 
-    def test_skips_mcp_json_without_api_key(self, tmp_path: Path):
+    def test_writes_mcp_json_without_api_key_env(self, tmp_path: Path):
+        """Config is written with ${HIRO_API_KEY} literal; env var is resolved at Claude Code load time."""
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HIRO_API_KEY", None)
             _setup_claude_code(tmp_path)
 
-        assert not (tmp_path / ".mcp.json").exists()
+        config = json.loads((tmp_path / ".mcp.json").read_text())
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
 
 
 class TestSetupCursor:
@@ -383,8 +386,8 @@ class TestSetupClaudeDesktop:
         assert "hiro-findings" not in config["mcpServers"]
         assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
         assert config["mcpServers"]["hiro-agents"]["url"] == "https://api.hiro.is/mcp/agents/mcp"
-        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer test-key-123"
-        assert config["mcpServers"]["hiro-agents"]["headers"]["Authorization"] == "Bearer test-key-123"
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
+        assert config["mcpServers"]["hiro-agents"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
 
     def test_preserves_existing_mcp_servers(self, tmp_path: Path):
         config_path = tmp_path / "Claude" / "claude_desktop_config.json"
@@ -421,17 +424,18 @@ class TestSetupClaudeDesktop:
         config = json.loads(config_path.read_text())
         assert "hiro-findings" not in config["mcpServers"]
 
-    def test_skips_when_no_api_key(self, tmp_path: Path):
+    def test_writes_without_api_key_env(self, tmp_path: Path):
+        """Config is written with ${HIRO_API_KEY} literal; env var is resolved at Claude Desktop load time."""
         config_path = tmp_path / "Claude" / "claude_desktop_config.json"
         config_path.parent.mkdir(parents=True)
 
         with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=config_path):
             with patch.dict(os.environ, {}, clear=False):
-                # Ensure no HIRO_API_KEY in env
                 os.environ.pop("HIRO_API_KEY", None)
                 _setup_claude_desktop(tmp_path)
 
-        assert not config_path.exists()
+        config = json.loads(config_path.read_text())
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
 
     def test_skips_on_unsupported_platform(self, tmp_path: Path):
         with patch("hiro_agent.setup_hooks._get_claude_desktop_config_path", return_value=None):
@@ -447,7 +451,7 @@ class TestSetupClaudeDesktop:
                 _setup_claude_desktop(tmp_path)
 
         config = json.loads(config_path.read_text())
-        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer env-key-456"
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
 
     def test_updates_existing_hiro_entry(self, tmp_path: Path):
         config_path = tmp_path / "Claude" / "claude_desktop_config.json"
@@ -465,7 +469,75 @@ class TestSetupClaudeDesktop:
 
         config = json.loads(config_path.read_text())
         assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
-        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer new-key"
+        assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
+
+
+class TestShellProfilePath:
+    def test_zsh(self):
+        with patch.dict(os.environ, {"SHELL": "/bin/zsh"}):
+            with patch("pathlib.Path.home", return_value=Path("/home/test")):
+                assert _shell_profile_path() == Path("/home/test/.zshrc")
+
+    def test_bash_prefers_existing(self, tmp_path: Path):
+        (tmp_path / ".bash_profile").write_text("")
+        with patch.dict(os.environ, {"SHELL": "/bin/bash"}):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                assert _shell_profile_path() == tmp_path / ".bash_profile"
+
+    def test_unknown_shell_returns_none(self):
+        with patch.dict(os.environ, {"SHELL": "/bin/fish"}):
+            assert _shell_profile_path() is None
+
+
+class TestPersistApiKeyInShell:
+    def test_appends_when_confirmed(self, tmp_path: Path):
+        profile = tmp_path / ".zshrc"
+        profile.write_text("# existing content\n")
+        with patch("hiro_agent.setup_hooks._shell_profile_path", return_value=profile):
+            with patch("click.confirm", return_value=True):
+                result = _persist_api_key_in_shell("my-secret-key")
+        content = profile.read_text()
+        assert 'export HIRO_API_KEY="my-secret-key"' in content
+        assert "# existing content" in content  # preserved
+        assert result == profile  # returns path so caller can remind user to reload
+
+    def test_sets_env_var_in_current_process(self, tmp_path: Path):
+        profile = tmp_path / ".zshrc"
+        profile.write_text("")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HIRO_API_KEY", None)
+            with patch("hiro_agent.setup_hooks._shell_profile_path", return_value=profile):
+                with patch("click.confirm", return_value=True):
+                    _persist_api_key_in_shell("my-secret-key")
+            # Subsequent setup steps in this process should see the key.
+            assert os.environ["HIRO_API_KEY"] == "my-secret-key"
+
+    def test_skips_when_already_present(self, tmp_path: Path):
+        profile = tmp_path / ".zshrc"
+        profile.write_text('export HIRO_API_KEY="old-key"\n')
+        with patch("hiro_agent.setup_hooks._shell_profile_path", return_value=profile):
+            result = _persist_api_key_in_shell("new-key")
+        # Existing line untouched, no new line appended.
+        assert profile.read_text() == 'export HIRO_API_KEY="old-key"\n'
+        assert result is None
+
+    def test_prints_instructions_when_declined(self, tmp_path: Path, capsys):
+        profile = tmp_path / ".zshrc"
+        profile.write_text("")
+        with patch("hiro_agent.setup_hooks._shell_profile_path", return_value=profile):
+            with patch("click.confirm", return_value=False):
+                result = _persist_api_key_in_shell("my-secret-key")
+        assert profile.read_text() == ""  # not modified
+        captured = capsys.readouterr()
+        assert "my-secret-key" in captured.out
+        assert result is None
+
+    def test_prints_instructions_when_no_profile(self, capsys):
+        with patch("hiro_agent.setup_hooks._shell_profile_path", return_value=None):
+            result = _persist_api_key_in_shell("my-secret-key")
+        captured = capsys.readouterr()
+        assert 'export HIRO_API_KEY="my-secret-key"' in captured.out
+        assert result is None
 
 
 class TestSetupGitPrecommit:

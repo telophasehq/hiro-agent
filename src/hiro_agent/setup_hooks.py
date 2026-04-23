@@ -191,12 +191,9 @@ def _setup_claude_code(project_root: Path) -> None:
     os.chmod(settings_file, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     click.echo(f"  Wrote {settings_file}")
 
-    # Configure MCP servers in .mcp.json (merge, don't overwrite)
-    api_key = _resolve_api_key(project_root)
-    if not api_key:
-        click.echo("  Skipping .mcp.json: No API key found.")
-        return
-
+    # Configure MCP servers in .mcp.json (merge, don't overwrite).
+    # Auth uses ${HIRO_API_KEY} substitution — Claude Code reads the env var
+    # at load time so the secret never lives on disk.
     mcp_file = project_root / ".mcp.json"
     if mcp_file.exists():
         try:
@@ -207,7 +204,7 @@ def _setup_claude_code(project_root: Path) -> None:
         mcp_config = {}
 
     mcp_servers = mcp_config.setdefault("mcpServers", {})
-    auth_headers = {"Authorization": f"Bearer {api_key}"}
+    auth_headers = {"Authorization": "Bearer ${HIRO_API_KEY}"}
 
     mcp_servers["hiro"] = {
         "type": "http",
@@ -225,6 +222,9 @@ def _setup_claude_code(project_root: Path) -> None:
     mcp_file.write_text(json.dumps(mcp_config, indent=2) + "\n")
     os.chmod(mcp_file, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     click.echo(f"  Wrote {mcp_file}")
+
+    if not os.environ.get("HIRO_API_KEY"):
+        click.echo("  Note: export HIRO_API_KEY in your shell for Claude Code to authenticate.")
 
 
 def _setup_cursor(project_root: Path) -> None:
@@ -425,15 +425,6 @@ def _get_claude_desktop_config_path() -> Path | None:
     return None
 
 
-def _resolve_api_key(project_root: Path) -> str | None:
-    """Return the Hiro API key from env var or .hiro/config.json, or None."""
-    env_key = os.environ.get("HIRO_API_KEY", "")
-    if env_key:
-        return env_key
-    config = _load_project_config(project_root)
-    return config.get("api_key") or None
-
-
 def _setup_claude_desktop(project_root: Path) -> None:
     """Configure Claude Desktop MCP server entries in the global config."""
     from hiro_agent._common import HIRO_AGENTS_MCP_URL, HIRO_MCP_URL
@@ -445,11 +436,6 @@ def _setup_claude_desktop(project_root: Path) -> None:
         click.echo("  Skipping: Claude Desktop is only supported on macOS.")
         return
 
-    api_key = _resolve_api_key(project_root)
-    if not api_key:
-        click.echo("  Skipping: No API key found. Set HIRO_API_KEY or run `hiro setup` first.")
-        return
-
     if config_path.exists():
         try:
             config = json.loads(config_path.read_text())
@@ -459,7 +445,7 @@ def _setup_claude_desktop(project_root: Path) -> None:
         config = {}
 
     mcp_servers = config.setdefault("mcpServers", {})
-    auth_headers = {"Authorization": f"Bearer {api_key}"}
+    auth_headers = {"Authorization": "Bearer ${HIRO_API_KEY}"}
 
     mcp_servers["hiro"] = {
         "url": HIRO_MCP_URL,
@@ -477,6 +463,9 @@ def _setup_claude_desktop(project_root: Path) -> None:
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     os.chmod(config_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     click.echo(f"  Wrote {config_path}")
+
+    if not os.environ.get("HIRO_API_KEY"):
+        click.echo("  Note: export HIRO_API_KEY in your shell for Claude Desktop to authenticate.")
 
 
 def _detect_tools(project_root: Path) -> list[str]:
@@ -526,18 +515,71 @@ def _save_project_config(project_root: Path, updates: dict) -> None:
     os.chmod(config_file, stat.S_IRUSR | stat.S_IWUSR)  # 0600
 
 
-def _prompt_api_key(project_root: Path) -> None:
-    """Prompt user for API key and store in .hiro/config.json."""
+def _shell_profile_path() -> Path | None:
+    """Return the likely shell rc file for the current shell, or None if unknown."""
+    shell = os.environ.get("SHELL", "")
+    home = Path.home()
+    if shell.endswith("/zsh"):
+        return home / ".zshrc"
+    if shell.endswith("/bash"):
+        # macOS login shells read .bash_profile; Linux reads .bashrc. Prefer whichever exists.
+        candidates = [home / ".bashrc", home / ".bash_profile"]
+        for c in candidates:
+            if c.exists():
+                return c
+        return candidates[0]
+    return None
+
+
+def _persist_api_key_in_shell(api_key: str) -> Path | None:
+    """Offer to append `export HIRO_API_KEY=...` to the user's shell rc file.
+
+    Returns the profile path if we wrote to it (so the caller can remind the user
+    to reload), else None.
+    """
+    # Make the key available to the rest of this Python process — subsequent setup
+    # steps that check HIRO_API_KEY will see it. This does NOT affect the user's
+    # shell after we exit (subprocess can't mutate parent env).
+    os.environ["HIRO_API_KEY"] = api_key
+
+    profile = _shell_profile_path()
+    export_line = f'export HIRO_API_KEY="{api_key}"'
+
+    if profile is None:
+        click.echo("  To authenticate Claude Code/Desktop, add this to your shell profile:")
+        click.echo(f"    {export_line}")
+        return None
+
+    if profile.exists() and "HIRO_API_KEY" in profile.read_text():
+        click.echo(f"  HIRO_API_KEY already referenced in {profile} — skipping.")
+        return None
+
+    if not click.confirm(f"  Append `export HIRO_API_KEY` to {profile}?", default=True):
+        click.echo("  To authenticate Claude Code/Desktop, run this (or add to your shell profile):")
+        click.echo(f"    {export_line}")
+        return None
+
+    with profile.open("a") as f:
+        f.write(f"\n# Added by `hiro setup`\n{export_line}\n")
+    click.echo(f"  Appended to {profile}.")
+    return profile
+
+
+def _prompt_api_key(project_root: Path) -> Path | None:
+    """Prompt user for API key and store in .hiro/config.json.
+
+    Returns the shell profile path if we appended an export line to it, else None.
+    """
     existing_env = os.environ.get("HIRO_API_KEY", "")
     if existing_env:
         click.echo(f"API key: using HIRO_API_KEY environment variable.")
-        return
+        return None
 
     existing = _load_project_config(project_root).get("api_key", "")
     if existing:
         click.echo(f"API key: found in .hiro/config.json")
         if not click.confirm("  Update it?", default=False):
-            return
+            return _persist_api_key_in_shell(existing)
 
     api_key = click.prompt(
         "Enter your Hiro API key (get one at https://app.hiro.is/settings/api-keys)",
@@ -548,10 +590,11 @@ def _prompt_api_key(project_root: Path) -> None:
 
     if not api_key:
         click.echo("  Skipped. Set HIRO_API_KEY env var or re-run `hiro setup` later.")
-        return
+        return None
 
     _save_project_config(project_root, {"api_key": api_key})
     click.echo(f"  Saved to .hiro/config.json")
+    return _persist_api_key_in_shell(api_key)
 
 
 def _run_hook_update(project_root: Path, tool_filter: str | None = None) -> None:
@@ -592,12 +635,18 @@ def run_setup(tool_filter: str | None = None) -> None:
     click.echo(f"Setting up Hiro in {project_root}\n")
 
     # Prompt for API key first
-    _prompt_api_key(project_root)
+    appended_profile = _prompt_api_key(project_root)
     click.echo()
 
     _run_hook_update(project_root, tool_filter)
 
     click.echo("\nDone! Hiro security review hooks are active.")
+
+    if appended_profile is not None:
+        click.echo()
+        click.echo("⚠  Reload your shell to pick up HIRO_API_KEY:")
+        click.echo(f"     source {appended_profile}")
+        click.echo("   (or open a new terminal — Claude Code/Desktop need this env var to authenticate)")
 
 
 def run_upgrade(tool_filter: str | None = None) -> None:
