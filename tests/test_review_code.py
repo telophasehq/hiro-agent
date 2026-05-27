@@ -53,7 +53,7 @@ class TestReviewCode:
 
         async def mock_tracked(*, name, prompt, **kwargs):
             captured["prompt"] = prompt
-            return ("Verdict: COMMENT\n", "sess")
+            return ("Verdict: APPROVE\n", "sess")
 
         with (
             patch("hiro_agent.review_code.prepare_mcp", return_value=mock_mcp_setup),

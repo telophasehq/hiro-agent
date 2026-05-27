@@ -64,11 +64,17 @@ class TestReviewCodePrompt:
         assert "Grep" in rendered
 
     def test_has_verdict_line_format(self):
-        """The report must start with a Verdict: line so downstream consumers can parse it."""
+        """The report must start with a Verdict: line so downstream consumers can parse it.
+
+        Hiro's verdict is binary by design — APPROVE or REQUEST_CHANGES,
+        no COMMENT third tier (it mapped to GitHub's COMMENTED event,
+        which doesn't satisfy branch protection).
+        """
         rendered = self._render()
         assert "Verdict: APPROVE" in rendered
         assert "Verdict: REQUEST_CHANGES" in rendered
-        assert "Verdict: COMMENT" in rendered
+        assert "Verdict: COMMENT" not in rendered
+        assert "BINARY" in rendered
 
     def test_has_report_sections(self):
         rendered = self._render()

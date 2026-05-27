@@ -37,17 +37,29 @@ def diff_hash(diff: str) -> str:
 def parse_verdict(report_text: str) -> str:
     """Extract the verdict from a review report.
 
-    Defaults to ``COMMENT`` if no verdict line is present, which keeps the
-    backend conservative — never auto-approve based on a missing/unparseable
-    verdict.
+    Hiro's verdict is binary: APPROVE or REQUEST_CHANGES. The legacy
+    third tier (COMMENT) is silently coerced to APPROVE when EXPLICITLY
+    EMITTED — older reviews on disk and back-compat with stale prompts
+    degrade gracefully to "approve with notes," matching the backend's
+    coercion in ``services/hiro_pr_reviewer._parse_verdict``.
+
+    Missing / unparseable verdict fails CLOSED to REQUEST_CHANGES.
+    Hiro is a safety control; the org's documented principle is that
+    safety systems must fail closed. The backend's auto-merge path
+    consumes the parsed verdict and only fails closed on null
+    risk/confidence — fail-open here would let a model that mangles
+    the Verdict header (e.g. via prompt-injection in PR content) reach
+    auto-merge as APPROVE.
     """
     for line in report_text.splitlines()[:10]:
-        stripped = line.strip()
+        stripped = line.strip().replace("*", "")
         if stripped.lower().startswith("verdict:"):
             value = stripped.split(":", 1)[1].strip().upper()
-            if value in ("APPROVE", "REQUEST_CHANGES", "COMMENT"):
+            if value == "COMMENT":
+                return "APPROVE"
+            if value in ("APPROVE", "REQUEST_CHANGES"):
                 return value
-    return "COMMENT"
+    return "REQUEST_CHANGES"
 
 
 def save_pending(
