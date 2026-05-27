@@ -174,12 +174,14 @@ The FIRST line of the report MUST be a verdict line in this exact format:
 
     Verdict: REQUEST_CHANGES
 
-    Verdict: COMMENT
-
-Pick one:
-- **APPROVE** — No findings, or only INFO/LOW severity with no exploitability concerns.
-- **REQUEST_CHANGES** — One or more CRITICAL/HIGH findings with MEDIUM+ exploitability.
-- **COMMENT** — Mixed/uncertain: medium-severity findings, or notable concerns that don't block but warrant discussion.
+Pick one — BINARY, no middle tier:
+- **APPROVE** — No CRITICAL/HIGH findings with MEDIUM+ exploitability. Use APPROVE \
+even when MEDIUM/LOW findings or informational observations remain — surface them in \
+the Findings section, NOT as a non-approving verdict. The body is for nuance; the \
+verdict is for whether the merge should proceed.
+- **REQUEST_CHANGES** — One or more CRITICAL/HIGH findings with MEDIUM+ exploitability. \
+This BLOCKS the merge — reserve it for real blockers. "Something to mention" goes in \
+the Findings section, not in this verdict.
 
 ### Executive Summary
 2-3 sentence overview.
