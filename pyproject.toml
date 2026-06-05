@@ -18,7 +18,9 @@ hiro = "hiro_agent.cli:main"
 [tool.uv]
 # Force the patched starlette (transitive via claude-agent-sdk -> mcp / sse-starlette).
 # Fixes CVE-2025-62727, CVE-2026-48710, AIKIDO-2026-10923.
-constraint-dependencies = ["starlette>=1.0.1"]
+# Force the patched python-dotenv (transitive via pydantic-settings).
+# Fixes CVE-2026-28684 (path traversal via symbolic links).
+constraint-dependencies = ["starlette>=1.0.1", "python-dotenv>=1.2.2"]
 
 [build-system]
 requires = ["hatchling"]
