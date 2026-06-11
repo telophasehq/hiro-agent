@@ -18,7 +18,8 @@ hiro = "hiro_agent.cli:main"
 [tool.uv]
 # Force the patched starlette (transitive via claude-agent-sdk -> mcp / sse-starlette).
 # Fixes CVE-2025-62727, CVE-2026-48710, AIKIDO-2026-10923.
-constraint-dependencies = ["starlette>=1.0.1"]
+# Force patched idna (transitive via claude-agent-sdk -> anyio / mcp -> httpx). Fixes CVE-2026-45409.
+constraint-dependencies = ["starlette>=1.0.1", "idna>=3.15"]
 
 [build-system]
 requires = ["hatchling"]
