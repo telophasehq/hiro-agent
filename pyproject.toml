@@ -20,7 +20,8 @@ hiro = "hiro_agent.cli:main"
 # Fixes CVE-2026-54283, CVE-2026-48818, CVE-2026-48817, CVE-2026-54282.
 # Force patched idna (transitive via claude-agent-sdk -> anyio / mcp -> httpx). Fixes CVE-2026-45409.
 # Force patched python-dotenv (transitive via claude-agent-sdk -> mcp -> pydantic-settings). Fixes CVE-2026-28684.
-constraint-dependencies = ["starlette>=1.3.1", "idna>=3.15", "python-dotenv>=1.2.2"]
+# Force patched pydantic-settings (transitive via claude-agent-sdk -> mcp). Fixes path traversal GHSA-4xgf-cpjx-pc3j.
+constraint-dependencies = ["starlette>=1.3.1", "idna>=3.15", "python-dotenv>=1.2.2", "pydantic-settings>=2.14.2"]
 
 [build-system]
 requires = ["hatchling"]
