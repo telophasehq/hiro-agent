@@ -1241,3 +1241,80 @@ class TestConfigureFileLogging:
         content = Path(log_path).read_text()
         assert "test_event" in content
         assert "key" in content
+
+
+class TestUserAgent:
+    """Every outbound HTTP surface must identify itself. http.client sends
+    NO User-Agent by default, and UA-less requests get dropped by common
+    WAF bot rules (NoUserAgent_HEADER blocked every CLI MCP call at the
+    api.hiro.is edge until the 2026-07-12 rule override)."""
+
+    def test_user_agent_constant_shape(self):
+        from hiro_agent import __version__
+        from hiro_agent._common import USER_AGENT
+
+        assert USER_AGENT == f"hiro-agent/{__version__}"
+
+    def test_mcp_config_headers_include_user_agent(self, monkeypatch):
+        from hiro_agent import _common
+
+        monkeypatch.setattr(_common, "_get_api_key", lambda: "hiro_ak_test")
+        config = _common._get_mcp_config()
+        headers = config["hiro"]["headers"]
+        assert headers["User-Agent"] == _common.USER_AGENT
+        assert headers["Authorization"] == "Bearer hiro_ak_test"
+
+    def test_mcp_call_tool_sends_user_agent(self, monkeypatch):
+        import hiro_agent._common as _common
+
+        captured = {}
+
+        class FakeResponse:
+            status = 500
+            reason = "test"
+
+            def read(self):
+                return b""
+
+        class FakeConn:
+            def __init__(self, *a, **kw):
+                pass
+
+            def request(self, method, path, body=None, headers=None):
+                captured["headers"] = headers or {}
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("http.client.HTTPSConnection", FakeConn)
+        _common._mcp_call_tool("hiro_ak_test", "get_org_context")
+        assert captured["headers"]["User-Agent"] == _common.USER_AGENT
+
+    def test_check_mcp_connection_sends_user_agent(self, monkeypatch):
+        import hiro_agent._common as _common
+
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+            reason = "OK"
+
+        class FakeConn:
+            def __init__(self, *a, **kw):
+                pass
+
+            def request(self, method, path, body=None, headers=None):
+                captured["headers"] = headers or {}
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("http.client.HTTPSConnection", FakeConn)
+        assert _common._check_mcp_connection("hiro_ak_test") is None
+        assert captured["headers"]["User-Agent"] == _common.USER_AGENT

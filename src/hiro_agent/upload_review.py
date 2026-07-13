@@ -20,7 +20,7 @@ from typing import Optional
 
 import structlog
 
-from hiro_agent._common import HIRO_BACKEND_URL, _get_api_key
+from hiro_agent._common import USER_AGENT, HIRO_BACKEND_URL, _get_api_key
 from hiro_agent.review_store import list_pending, mark_uploaded
 
 logger = structlog.get_logger(__name__)
@@ -73,6 +73,7 @@ def _post_review(*, api_key: str, payload: dict) -> tuple[int, str]:
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "User-Agent": USER_AGENT,
         },
     )
     try:

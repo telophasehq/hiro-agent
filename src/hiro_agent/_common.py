@@ -30,6 +30,8 @@ from claude_agent_sdk import (
 from claude_agent_sdk._errors import MessageParseError
 from claude_agent_sdk.types import AgentDefinition, McpHttpServerConfig, ToolResultBlock
 
+from hiro_agent import __version__
+
 IGNORED_DIRS: frozenset[str] = frozenset({
     ".cache", ".git", ".mypy_cache", ".next", ".nuxt", ".npm", ".pnp",
     ".pytest_cache", ".ruff_cache", ".serverless", ".terraform", ".venv",
@@ -45,6 +47,13 @@ HIRO_MCP_URL = "https://api.hiro.is/mcp/architect/mcp"
 HIRO_INTERNAL_MCP_URL = "https://api.hiro.is/mcp/architect/internal/mcp"
 HIRO_AGENTS_MCP_URL = "https://api.hiro.is/mcp/agents/mcp"
 HIRO_BACKEND_URL = "https://api.hiro.is"
+
+# Sent on every outbound request. http.client sends NO User-Agent by
+# default, and UA-less requests are dropped by common WAF bot rules
+# (AWSManagedRulesCommonRuleSet NoUserAgent_HEADER blocked every CLI
+# MCP call at the api.hiro.is edge until 2026-07-12) — identify
+# ourselves properly rather than depend on an edge exception.
+USER_AGENT = f"hiro-agent/{__version__}"
 
 _EXPLORE_AGENT = AgentDefinition(
     description="Read-only code retriever. Returns raw code — never analyzes or evaluates.",
@@ -107,7 +116,10 @@ def _get_mcp_config() -> dict[str, McpHttpServerConfig]:
         "hiro": McpHttpServerConfig(
             type="http",
             url=HIRO_MCP_URL,
-            headers={"Authorization": f"Bearer {key}"},
+            headers={
+                "Authorization": f"Bearer {key}",
+                "User-Agent": USER_AGENT,
+            },
         ),
     }
 
@@ -141,6 +153,7 @@ def _check_mcp_connection(api_key: str) -> str | None:
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
+                "User-Agent": USER_AGENT,
             },
         )
         resp = conn.getresponse()
@@ -190,6 +203,7 @@ def _mcp_call_tool(api_key: str, tool_name: str, arguments: dict | None = None, 
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
+                "User-Agent": USER_AGENT,
             },
         )
         resp = conn.getresponse()
