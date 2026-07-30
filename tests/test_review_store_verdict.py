@@ -47,3 +47,36 @@ def test_only_scans_first_ten_lines():
     can't smuggle through an APPROVE."""
     text = "\n".join(["filler"] * 12) + "\nVerdict: REQUEST_CHANGES\n"
     assert parse_verdict(text) == "REQUEST_CHANGES"  # fail-closed on missing
+
+
+def test_downgrade_rewrites_every_approve_variant():
+    """Truncated reviews must never approve — every formatting variant
+    parse_verdict would read as APPROVE must be caught."""
+    from hiro_agent.review_store import downgrade_verdict_to_request_changes
+
+    for variant in (
+        "Verdict: APPROVE",
+        "**Verdict:** **APPROVE**",
+        "verdict: approve",
+        "Verdict: Approve",
+        "Verdict: COMMENT",  # coerces to APPROVE downstream
+    ):
+        downgraded = downgrade_verdict_to_request_changes(f"{variant}\n\nbody")
+        assert parse_verdict(downgraded) == "REQUEST_CHANGES", variant
+
+
+def test_downgrade_catches_verdict_beyond_first_ten_lines():
+    """Annotations prepended by the conclude path shift the verdict down;
+    the downgrade must scan the whole text."""
+    from hiro_agent.review_store import downgrade_verdict_to_request_changes
+
+    text = "\n".join(["note"] * 12) + "\n**Verdict:** **APPROVE**\n"
+    downgraded = downgrade_verdict_to_request_changes(text)
+    assert "APPROVE" not in downgraded
+
+
+def test_downgrade_leaves_request_changes_untouched():
+    from hiro_agent.review_store import downgrade_verdict_to_request_changes
+
+    text = "Verdict: REQUEST_CHANGES\n\nfindings"
+    assert downgrade_verdict_to_request_changes(text) == text

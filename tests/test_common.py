@@ -24,6 +24,7 @@ from hiro_agent._common import (
     _mcp_call_tool,
     _prefetch_mcp_context,
     _run_tracked_agent,
+    AgentResultError,
     get_tool_policy_violation,
     prepare_mcp,
     run_review_agent,
@@ -638,6 +639,223 @@ class TestRunTrackedAgent:
 
         assert text == "skill findings here"
         assert session_id == ""  # No ResultMessage in mock
+
+    @pytest.mark.asyncio
+    async def test_stops_reading_after_result_message(self):
+        """The stream must not be read past the ResultMessage — the CLI
+        exits non-zero after an error result, and reading past the result
+        turns that exit into an opaque SDK exception."""
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        async def mock_query(prompt, options):
+            yield AssistantMessage(
+                content=[TextBlock(text="report")],
+                model="claude-opus-4-5",
+            )
+            yield ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1,
+                is_error=False, num_turns=2, session_id="sess-1",
+            )
+            raise AssertionError("stream read past ResultMessage")
+
+        setup = McpSetup(mcp_config={}, mcp_tools=[], org_context=None, security_policy=None)
+
+        with patch("hiro_agent._common.query", side_effect=mock_query):
+            text, session_id = await _run_tracked_agent(
+                name="review",
+                prompt="review the diff",
+                system_prompt="system",
+                cwd="/tmp",
+                allowed_tools=["Read"],
+                mcp_setup=setup,
+            )
+
+        assert text == "report"
+        assert session_id == "sess-1"
+
+    @pytest.mark.asyncio
+    async def test_error_result_raises_agent_result_error(self):
+        """Non-max-turns error results surface as a typed error, not a crash."""
+        from claude_agent_sdk import ResultMessage
+
+        async def mock_query(prompt, options):
+            yield ResultMessage(
+                subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
+                is_error=True, num_turns=2, session_id="sess-1",
+            )
+
+        setup = McpSetup(mcp_config={}, mcp_tools=[], org_context=None, security_policy=None)
+
+        with patch("hiro_agent._common.query", side_effect=mock_query):
+            with pytest.raises(AgentResultError) as exc_info:
+                await _run_tracked_agent(
+                    name="review",
+                    prompt="review the diff",
+                    system_prompt="system",
+                    cwd="/tmp",
+                    allowed_tools=["Read"],
+                    mcp_setup=setup,
+                )
+
+        assert exc_info.value.subtype == "error_during_execution"
+        assert exc_info.value.session_id == "sess-1"
+
+    @pytest.mark.asyncio
+    async def test_max_turns_resumes_session_to_conclude(self):
+        """error_max_turns triggers one resumed run that forces a report."""
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        calls = []
+        streams = [
+            [
+                ResultMessage(
+                    subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+                    is_error=True, num_turns=31, session_id="sess-1",
+                ),
+            ],
+            [
+                AssistantMessage(
+                    # Markdown-emphasis variant — parse_verdict reads this
+                    # as APPROVE, so the downgrade must catch it too.
+                    content=[TextBlock(text="**Verdict:** **APPROVE**")],
+                    model="claude-opus-4-5",
+                ),
+                ResultMessage(
+                    subtype="success", duration_ms=1, duration_api_ms=1,
+                    is_error=False, num_turns=1, session_id="sess-1",
+                ),
+            ],
+        ]
+
+        async def mock_query(prompt, options):
+            calls.append({"prompt": prompt, "resume": options.resume})
+            for msg in streams[len(calls) - 1]:
+                yield msg
+
+        setup = McpSetup(mcp_config={}, mcp_tools=[], org_context=None, security_policy=None)
+
+        with patch("hiro_agent._common.query", side_effect=mock_query):
+            text, session_id = await _run_tracked_agent(
+                name="review",
+                prompt="review the diff",
+                system_prompt="system",
+                cwd="/tmp",
+                allowed_tools=["Read"],
+                mcp_setup=setup,
+                max_turns=30,
+            )
+
+        # A truncated review must never approve — the verdict is
+        # downgraded mechanically and the report is annotated. Assert at
+        # the parser level: whatever the model's formatting, the persisted
+        # verdict must come out REQUEST_CHANGES.
+        from hiro_agent.review_store import parse_verdict
+
+        assert parse_verdict(text) == "REQUEST_CHANGES"
+        assert "**Verdict:** **APPROVE**" not in text
+        assert "turn budget" in text
+        assert session_id == "sess-1"
+        assert len(calls) == 2
+        assert calls[0]["resume"] is None
+        assert calls[1]["resume"] == "sess-1"
+        assert "final report now" in calls[1]["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_conclude_attempt_failure_raises(self):
+        """If the resumed conclude run also errors, raise instead of looping."""
+        from claude_agent_sdk import ResultMessage
+
+        calls = []
+
+        async def mock_query(prompt, options):
+            calls.append(options.resume)
+            yield ResultMessage(
+                subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+                is_error=True, num_turns=31, session_id="sess-1",
+            )
+
+        setup = McpSetup(mcp_config={}, mcp_tools=[], org_context=None, security_policy=None)
+
+        with patch("hiro_agent._common.query", side_effect=mock_query):
+            with pytest.raises(AgentResultError) as exc_info:
+                await _run_tracked_agent(
+                    name="review",
+                    prompt="review the diff",
+                    system_prompt="system",
+                    cwd="/tmp",
+                    allowed_tools=["Read"],
+                    mcp_setup=setup,
+                )
+
+        assert exc_info.value.subtype == "error_max_turns"
+        assert len(calls) == 2  # original + one conclude attempt, no loop
+
+    @pytest.mark.asyncio
+    async def test_conclude_empty_output_raises(self):
+        """An empty conclusion must fail closed, not clear the gate."""
+        from claude_agent_sdk import ResultMessage
+
+        streams = [
+            [
+                ResultMessage(
+                    subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+                    is_error=True, num_turns=31, session_id="sess-1",
+                ),
+            ],
+            [
+                ResultMessage(
+                    subtype="success", duration_ms=1, duration_api_ms=1,
+                    is_error=False, num_turns=1, session_id="sess-1",
+                ),
+            ],
+        ]
+        calls = []
+
+        async def mock_query(prompt, options):
+            calls.append(options.resume)
+            for msg in streams[len(calls) - 1]:
+                yield msg
+
+        setup = McpSetup(mcp_config={}, mcp_tools=[], org_context=None, security_policy=None)
+
+        with patch("hiro_agent._common.query", side_effect=mock_query):
+            with pytest.raises(AgentResultError) as exc_info:
+                await _run_tracked_agent(
+                    name="review",
+                    prompt="review the diff",
+                    system_prompt="system",
+                    cwd="/tmp",
+                    allowed_tools=["Read"],
+                    mcp_setup=setup,
+                )
+
+        assert exc_info.value.subtype == "error_max_turns"
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_run_review_agent_error_result_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """run_review_agent must not return partial output as success."""
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        async def mock_query(prompt, options):
+            yield AssistantMessage(
+                content=[TextBlock(text="partial findings")],
+                model="claude-opus-4-5",
+            )
+            yield ResultMessage(
+                subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+                is_error=True, num_turns=31, session_id="sess-1",
+            )
+
+        monkeypatch.chdir(tmp_path)
+        with patch("hiro_agent._common.query", side_effect=mock_query):
+            with patch.dict(os.environ, {}, clear=True):
+                os.environ.pop("HIRO_API_KEY", None)
+                with pytest.raises(AgentResultError) as exc_info:
+                    await run_review_agent(prompt="Review", system_prompt="System")
+
+        assert exc_info.value.subtype == "error_max_turns"
+        assert exc_info.value.partial_output == "partial findings"
 
     @pytest.mark.asyncio
     async def test_adds_proxy_tool_turn_constraint_with_hiro_key(self):

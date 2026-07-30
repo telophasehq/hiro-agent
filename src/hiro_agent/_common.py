@@ -499,6 +499,18 @@ async def run_review_agent(
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         summary = block.text
+            elif isinstance(message, ResultMessage):
+                # Terminal message — the CLI exits non-zero after an error
+                # result; reading past it crashes the stream. An error
+                # result must not return as a successful (partial) review.
+                if message.is_error:
+                    raise AgentResultError(
+                        agent="review",
+                        subtype=str(message.subtype or "error"),
+                        partial_output=summary,
+                        session_id=message.session_id,
+                    )
+                break
     finally:
         await _safe_close_query_stream(stream, context="run_review_agent")
 
@@ -841,6 +853,16 @@ async def _run_streaming_plain(
                         print(f"error: {err_short}", file=sys.stderr, flush=True)
                 continue
 
+            if isinstance(message, ResultMessage):
+                # Terminal message — the CLI exits non-zero after an error
+                # result; reading past it crashes the stream.
+                if message.is_error:
+                    print(
+                        f"error: agent stopped early ({message.subtype})",
+                        file=sys.stderr, flush=True,
+                    )
+                break
+
             if not isinstance(message, AssistantMessage):
                 continue
 
@@ -932,6 +954,19 @@ async def _run_streaming_tty(
                         plan.start_report()
                         spinner.resume()
                 continue
+
+            if isinstance(message, ResultMessage):
+                # Terminal message — the CLI exits non-zero after an error
+                # result; reading past it crashes the stream.
+                if message.is_error:
+                    spinner.pause()
+                    print(
+                        f"    {_RED}error: agent stopped early "
+                        f"({message.subtype}){_RESET}",
+                        file=sys.stderr, flush=True,
+                    )
+                    spinner.resume()
+                break
 
             if not isinstance(message, AssistantMessage):
                 continue
@@ -1174,6 +1209,38 @@ def _tool_summary(name: str, inp: dict) -> str:
 # Agent runner and display helpers
 # ---------------------------------------------------------------------------
 
+class AgentResultError(RuntimeError):
+    """The agent run ended with an error result (e.g. ran out of turns).
+
+    Raised instead of letting the CLI's non-zero exit surface as an opaque
+    SDK exception. ``partial_output`` holds whatever text the agent emitted
+    before the run ended — it is NOT a completed report.
+    """
+
+    def __init__(self, agent: str, subtype: str, partial_output: str, session_id: str):
+        self.agent = agent
+        self.subtype = subtype
+        self.partial_output = partial_output
+        self.session_id = session_id
+        super().__init__(f"agent '{agent}' ended with error result: {subtype}")
+
+
+_CONCLUDE_PROMPT = (
+    "You have exhausted your investigation budget. Do not call any more "
+    "tools. Using only the evidence you have already gathered, write your "
+    "complete final report now, in the exact format required by your "
+    "instructions. Your investigation is incomplete, so you must not "
+    "certify the changes as safe: if your report format includes a "
+    "verdict, it must be REQUEST_CHANGES, noting what you could not "
+    "verify."
+)
+
+_TRUNCATED_REVIEW_NOTE = (
+    "**Note: this review hit its investigation turn budget and was "
+    "concluded from partial evidence. A truncated review cannot APPROVE.**"
+)
+
+
 async def _run_tracked_agent(
     *,
     name: str,
@@ -1191,8 +1258,15 @@ async def _run_tracked_agent(
     on_result: Callable[[ResultMessage], None] | None = None,
     on_text: Callable[[str], None] | None = None,
     on_todos: Callable[[str, list[dict]], None] | None = None,
+    resume_session_id: str | None = None,
+    conclude_on_max_turns: bool = True,
 ) -> tuple[str, str]:
     """Run a single skill agent and return its final text output.
+
+    When the run ends on ``error_max_turns`` and ``conclude_on_max_turns``
+    is set, the session is resumed once with a no-more-tools prompt so the
+    agent writes its report from evidence already gathered. Runs that still
+    end in an error result raise :class:`AgentResultError`.
 
     On each ``ToolUseBlock`` emitted by the agent, calls
     ``on_tool(agent_name, tool_name, summary, is_subagent)`` so the
@@ -1268,6 +1342,7 @@ async def _run_tracked_agent(
         agents={"explore": _EXPLORE_AGENT},
         env=_get_agent_env(),
         stderr=_stderr_heartbeat,
+        resume=resume_session_id,
     )
 
     run_started_at = _time.monotonic()
@@ -1286,6 +1361,7 @@ async def _run_tracked_agent(
     summary = ""
     all_text_blocks: list[str] = []  # Accumulate all primary agent text
     session_id = ""
+    result_error_subtype: str | None = None
     active_task_ids: set[str] = set()  # Track Task sub-agent tool_use_ids
     tool_start_times: dict[str, float] = {}
     tool_meta: dict[str, tuple[str, bool, str]] = {}
@@ -1532,12 +1608,17 @@ async def _run_tracked_agent(
                     duration_ms=message.duration_ms,
                     elapsed_s=round(now - run_started_at, 1),
                 )
+                if message.is_error:
+                    result_error_subtype = str(message.subtype or "error")
                 if on_result is not None:
                     try:
                         on_result(message)
                     except BaseException as exc:
                         _capture_callback_error(exc)
-                        break
+                # The result message is terminal. On error results the CLI
+                # exits non-zero, and reading past the result surfaces that
+                # exit as an opaque SDK exception — stop here instead.
+                break
     except BaseException as exc:
         run_error = exc
         raise
@@ -1577,9 +1658,68 @@ async def _run_tracked_agent(
     if callback_error is not None:
         raise callback_error
 
+    full_output = "\n\n".join(all_text_blocks) if all_text_blocks else summary
+
+    if result_error_subtype is not None:
+        if (
+            result_error_subtype == "error_max_turns"
+            and conclude_on_max_turns
+            and session_id
+            and resume_session_id is None
+        ):
+            logger.warning(
+                "agent_max_turns_concluding",
+                agent=name,
+                max_turns=max_turns,
+                session_id=session_id,
+            )
+            concluded, concluded_session = await _run_tracked_agent(
+                name=name,
+                prompt=_CONCLUDE_PROMPT,
+                system_prompt=system_prompt,
+                cwd=cwd,
+                allowed_tools=allowed_tools,
+                mcp_setup=mcp_setup,
+                max_turns=6,
+                model=model,
+                effort=effort,
+                thinking_budget=thinking_budget,
+                on_tool=on_tool,
+                on_tool_event=on_tool_event,
+                on_result=on_result,
+                on_text=on_text,
+                on_todos=on_todos,
+                resume_session_id=session_id,
+            )
+            # A truncated review ran on partial evidence and must never
+            # approve — enforce fail-closed mechanically rather than
+            # trusting the conclude prompt. The downgrade shares
+            # parse_verdict's normalization so no formatting variant the
+            # parser accepts can escape it.
+            from hiro_agent.review_store import (
+                downgrade_verdict_to_request_changes,
+            )
+            if not concluded.strip():
+                # An empty conclusion is a failed review — returning it
+                # as success would clear the commit gate with no report.
+                raise AgentResultError(
+                    agent=name,
+                    subtype="error_max_turns",
+                    partial_output=full_output,
+                    session_id=concluded_session or session_id,
+                )
+            concluded = downgrade_verdict_to_request_changes(concluded)
+            concluded = f"{_TRUNCATED_REVIEW_NOTE}\n\n{concluded}"
+            return concluded, concluded_session
+        raise AgentResultError(
+            agent=name,
+            subtype=result_error_subtype,
+            partial_output=full_output,
+            session_id=session_id,
+        )
+
     # Return all accumulated text from the primary agent, joined.
     # Falls back to last TextBlock if nothing was accumulated.
-    full_output = "\n\n".join(all_text_blocks) if all_text_blocks else summary
     return full_output, session_id
 
 
