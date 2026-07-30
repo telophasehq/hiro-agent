@@ -62,6 +62,25 @@ def parse_verdict(report_text: str) -> str:
     return "REQUEST_CHANGES"
 
 
+def downgrade_verdict_to_request_changes(report_text: str) -> str:
+    """Rewrite every verdict line in the report to REQUEST_CHANGES.
+
+    Uses the same line normalization as :func:`parse_verdict` (strip
+    ``*``, case-insensitive), so no formatting variant that the parser
+    would read as APPROVE — including the COMMENT coercion — can escape
+    the downgrade. Scans the whole text, not just the first 10 lines,
+    because callers may prepend annotations that shift the verdict down.
+    """
+    lines = report_text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.strip().replace("*", "")
+        if stripped.lower().startswith("verdict:"):
+            value = stripped.split(":", 1)[1].strip().upper()
+            if value and value != "REQUEST_CHANGES":
+                lines[i] = "Verdict: REQUEST_CHANGES"
+    return "\n".join(lines)
+
+
 def save_pending(
     *,
     cwd: str | os.PathLike[str] | None,

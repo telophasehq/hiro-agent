@@ -154,7 +154,7 @@ async def review_code(
                     cwd=cwd,
                     allowed_tools=["Read", "Grep"],
                     mcp_setup=mcp_setup,
-                    max_turns=30,
+                    max_turns=60,
                     model="opus",
                     thinking_budget=30_000,
                     on_tool=_on_tool,
@@ -215,8 +215,11 @@ async def review_code(
             except Exception:
                 logger.warning("review_persist_failed", exc_info=True)
 
-        # Clear pre-commit gate so `git commit` is unblocked.
-        _clear_review_state(cwd)
+            # Clear pre-commit gate so `git commit` is unblocked — only
+            # when a report was actually produced (fail closed).
+            _clear_review_state(cwd)
+        else:
+            logger.warning("review_empty_output_gate_left_armed")
 
     finally:
         # Clean up the temp diff file.

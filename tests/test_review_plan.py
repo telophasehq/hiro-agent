@@ -129,8 +129,8 @@ class TestReviewPlan:
             assert title in system, f"Missing playbook section for {skill_name}"
 
     @pytest.mark.asyncio
-    async def test_max_turns_is_30(self, mock_mcp_setup, tmp_cwd):
-        """Review agent is given a 30-turn budget."""
+    async def test_max_turns_is_60(self, mock_mcp_setup, tmp_cwd):
+        """Review agent is given a 60-turn budget."""
         captured = {}
 
         async def mock_tracked(*, name, max_turns=None, **kwargs):
@@ -143,7 +143,7 @@ class TestReviewPlan:
         ):
             await review_plan("plan", cwd=tmp_cwd)
 
-        assert captured["max_turns"] == 30
+        assert captured["max_turns"] == 60
 
     @pytest.mark.asyncio
     async def test_output_written_to_file(self, mock_mcp_setup, tmp_cwd, tmp_path):

@@ -116,6 +116,7 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     Usage with AI coding tools (Claude Code, Cursor, etc.):
       git diff | hiro review-code
     """
+    from hiro_agent._common import AgentResultError
     from hiro_agent.review_code import review_code
 
     log_path = _configure_file_logging()
@@ -130,16 +131,25 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     mirror = sys.stdout.isatty()
 
     click.echo(f"outputting review to {review_output}")
-    asyncio.run(
-        review_code(
-            diff,
-            cwd=cwd,
-            context=context,
-            verbose=not quiet,
-            output_file=review_output,
-            mirror_to_stdout=mirror,
+    try:
+        asyncio.run(
+            review_code(
+                diff,
+                cwd=cwd,
+                context=context,
+                verbose=not quiet,
+                output_file=review_output,
+                mirror_to_stdout=mirror,
+            )
         )
-    )
+    except AgentResultError as exc:
+        click.echo(
+            f"\nError: the review agent stopped without producing a verdict ({exc.subtype}). "
+            "No APPROVE was issued — treat as REQUEST_CHANGES. Re-run, or review a smaller diff.",
+            err=True,
+        )
+        click.echo(f"Log: {log_path}", err=True)
+        raise SystemExit(2) from None
     click.echo(f"\nLog: {log_path}", err=True)
 
 
@@ -154,6 +164,7 @@ def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     Usage with AI coding tools (Claude Code, Cursor, etc.):
       cat plan.md | hiro review-plan
     """
+    from hiro_agent._common import AgentResultError
     from hiro_agent.review_plan import review_plan
 
     log_path = _configure_file_logging()
@@ -168,16 +179,25 @@ def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     mirror = sys.stdout.isatty()
 
     click.echo(f"outputting review to {review_output}")
-    asyncio.run(
-        review_plan(
-            plan,
-            cwd=cwd,
-            context=context,
-            verbose=not quiet,
-            output_file=review_output,
-            mirror_to_stdout=mirror,
+    try:
+        asyncio.run(
+            review_plan(
+                plan,
+                cwd=cwd,
+                context=context,
+                verbose=not quiet,
+                output_file=review_output,
+                mirror_to_stdout=mirror,
+            )
         )
-    )
+    except AgentResultError as exc:
+        click.echo(
+            f"\nError: the review agent stopped without producing a verdict ({exc.subtype}). "
+            "No APPROVE was issued — treat as REQUEST_CHANGES. Re-run, or review a smaller plan.",
+            err=True,
+        )
+        click.echo(f"Log: {log_path}", err=True)
+        raise SystemExit(2) from None
     click.echo(f"\nLog: {log_path}", err=True)
 
 
@@ -186,25 +206,33 @@ def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
 @click.option("--output", "-o", "output_file", default=None, type=click.Path(), help="Write report to file instead of stdout.")
 def review_infra_cmd(filepath: str | None, output_file: str | None) -> None:
     """Review infrastructure config for security issues. File arg or stdin."""
+    from hiro_agent._common import AgentResultError
     from hiro_agent.review_infra import review_infrastructure
 
     _configure_file_logging()
     click.echo("Reviewing infrastructure...\n", err=True)
-    if filepath:
-        filename = os.path.basename(filepath)
-        filepath = os.path.abspath(filepath)
-        cwd = os.path.dirname(filepath)
-        result = asyncio.run(
-            review_infrastructure(filepath, filename=filename, cwd=cwd)
+    try:
+        if filepath:
+            filename = os.path.basename(filepath)
+            filepath = os.path.abspath(filepath)
+            cwd = os.path.dirname(filepath)
+            result = asyncio.run(
+                review_infrastructure(filepath, filename=filename, cwd=cwd)
+            )
+        else:
+            config = _read_stdin("review-infra")
+            if not config.strip():
+                click.echo("Error: Empty input. Usage: hiro review-infra <file>", err=True)
+                raise SystemExit(1)
+            result = asyncio.run(
+                review_infrastructure(config, filename="stdin")
+            )
+    except AgentResultError as exc:
+        click.echo(
+            f"Error: the review agent stopped without producing a report ({exc.subtype}).",
+            err=True,
         )
-    else:
-        config = _read_stdin("review-infra")
-        if not config.strip():
-            click.echo("Error: Empty input. Usage: hiro review-infra <file>", err=True)
-            raise SystemExit(1)
-        result = asyncio.run(
-            review_infrastructure(config, filename="stdin")
-        )
+        raise SystemExit(2) from None
 
     if output_file:
         Path(output_file).write_text(result)
