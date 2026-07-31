@@ -16,6 +16,8 @@ from hiro_agent._common import (
     HIRO_MCP_URL,
     McpSetup,
     _EXPLORE_AGENT,
+    _PINNED_MODELS,
+    _resolve_model,
     _ScanDisplay,
     _get_agent_env,
     _get_api_key,
@@ -202,8 +204,9 @@ class TestRunReviewAgent:
         assert "mcp__hiro__remember" not in allowed
         assert "mcp__hiro__set_org_context" not in allowed
         assert "mcp__hiro__forget" not in allowed
-        # Model should default to opus
-        assert captured_options["model"] == "opus"
+        # Model should default to the pinned opus id (aliases never reach
+        # the CLI — the local binary would resolve them to whatever is newest)
+        assert captured_options["model"] == _PINNED_MODELS["opus"]
 
     @pytest.mark.asyncio
     async def test_prefetched_context_injected_into_prompt(self):
@@ -399,8 +402,8 @@ class TestExploreAgent:
     """Test _EXPLORE_AGENT definition."""
 
     def test_explore_agent_defined(self):
-        """Explore agent should use opus model with read-only tools."""
-        assert _EXPLORE_AGENT.model == "sonnet"
+        """Explore agent should use the pinned sonnet id with read-only tools."""
+        assert _EXPLORE_AGENT.model == _PINNED_MODELS["sonnet"]
         assert set(_EXPLORE_AGENT.tools) == {"Read", "Grep"}
         assert "read-only" in _EXPLORE_AGENT.description.lower() or "retriever" in _EXPLORE_AGENT.description.lower()
 
@@ -424,7 +427,7 @@ class TestModelParameter:
                 os.environ.pop("HIRO_API_KEY", None)
                 await run_review_agent(prompt="Review", system_prompt="System")
 
-        assert captured_options["model"] == "opus"
+        assert captured_options["model"] == _PINNED_MODELS["opus"]
 
     @pytest.mark.asyncio
     async def test_default_model_is_opus_streaming(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -442,7 +445,7 @@ class TestModelParameter:
                 os.environ.pop("HIRO_API_KEY", None)
                 await run_streaming_agent(prompt="Review", system_prompt="System")
 
-        assert captured_options["model"] == "opus"
+        assert captured_options["model"] == _PINNED_MODELS["opus"]
 
     @pytest.mark.asyncio
     async def test_model_parameter_forwarded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -462,7 +465,25 @@ class TestModelParameter:
                     prompt="Review", system_prompt="System", model="sonnet",
                 )
 
-        assert captured_options["model"] == "sonnet"
+        assert captured_options["model"] == _PINNED_MODELS["sonnet"]
+
+
+class TestResolveModel:
+    """Aliases pin to concrete ids; the local CLI never resolves them."""
+
+    def test_aliases_pin_to_concrete_ids(self):
+        for alias, pinned in _PINNED_MODELS.items():
+            assert _resolve_model(alias) == pinned
+            # Pinned ids are concrete (versioned) ids, not bare aliases the
+            # CLI would re-resolve.
+            assert pinned not in _PINNED_MODELS or pinned != alias
+
+    def test_concrete_ids_pass_through(self):
+        assert _resolve_model("claude-opus-4-8") == "claude-opus-4-8"
+
+    def test_env_override_wins(self, monkeypatch):
+        monkeypatch.setenv("HIRO_AGENT_MODEL_OPUS", "claude-opus-5")
+        assert _resolve_model("opus") == "claude-opus-5"
 
 
 class TestNoEventLoopBlocking:

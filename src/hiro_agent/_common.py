@@ -55,6 +55,28 @@ HIRO_BACKEND_URL = "https://api.hiro.is"
 # ourselves properly rather than depend on an edge exception.
 USER_AGENT = f"hiro-agent/{__version__}"
 
+# The Claude Code CLI resolves bare aliases ("opus") to whatever model that
+# binary considers current — and the binary auto-updates, so a CLI update
+# silently changes which model reviews run on and what request shapes hit
+# the Hiro proxy (Claude 5 CLIs started sending claude-opus-5 + system-role
+# turns the proxy had never seen). Pin every alias to a concrete request id
+# here; the Hiro proxy decides what each id actually serves, so model policy
+# stays server-side instead of in whatever CLI a customer has installed.
+_PINNED_MODELS = {
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+}
+
+
+def _resolve_model(model: str) -> str:
+    """Pin a model alias to a concrete id (HIRO_AGENT_MODEL_<ALIAS> overrides)."""
+    override = os.environ.get(f"HIRO_AGENT_MODEL_{model.upper()}", "")
+    if override:
+        return override
+    return _PINNED_MODELS.get(model, model)
+
+
 _EXPLORE_AGENT = AgentDefinition(
     description="Read-only code retriever. Returns raw code — never analyzes or evaluates.",
     prompt=(
@@ -86,7 +108,7 @@ _EXPLORE_AGENT = AgentDefinition(
         "Only Read the specific sections that matched."
     ),
     tools=["Read", "Grep"],
-    model="sonnet",
+    model=_resolve_model("sonnet"),
 )
 
 def _get_api_key() -> str:
@@ -483,7 +505,7 @@ async def run_review_agent(
         mcp_servers=mcp_config,
         permission_mode="acceptEdits",
         max_turns=max_turns,
-        model=model,
+        model=_resolve_model(model),
         effort="high",
         env=_get_agent_env(),
         stderr=lambda line: logger.debug("cli_stderr", agent="review", line=line.rstrip()),
@@ -813,7 +835,7 @@ async def run_streaming_agent(
         mcp_servers=mcp_config,
         permission_mode="acceptEdits",
         max_turns=max_turns,
-        model=model,
+        model=_resolve_model(model),
         effort="medium",
         env=_get_agent_env(),
         stderr=_capture_stderr,
@@ -1336,7 +1358,7 @@ async def _run_tracked_agent(
         mcp_servers=mcp_setup.mcp_config,
         permission_mode="acceptEdits",
         max_turns=max_turns,
-        model=model,
+        model=_resolve_model(model),
         effort=effort,
         thinking=_thinking_config,
         agents={"explore": _EXPLORE_AGENT},
