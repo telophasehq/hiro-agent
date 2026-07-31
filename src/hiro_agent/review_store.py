@@ -34,50 +34,85 @@ def diff_hash(diff: str) -> str:
     return hashlib.sha256(diff.encode("utf-8", errors="replace")).hexdigest()
 
 
+_VERDICT_TOKENS = ("APPROVE", "REQUEST_CHANGES", "COMMENT")
+
+
+def _verdict_line_value(line: str) -> Optional[str]:
+    """The verdict token if this line is a verdict line, else None.
+
+    A verdict line is ``<label>: <value>`` where the label's last word
+    is ``verdict`` — tolerant to the markdown the model wraps around
+    the contract format (``### Verdict:``, ``**Overall verdict:**``).
+    The value is the first recognisable token, tolerant to emphasis and
+    decoration (``**APPROVE** ✅``). Backtick-quoted mentions of the
+    contract (`` `Verdict: APPROVE` `` in prose) don't match: the
+    backtick survives normalization and breaks the label. Returns the
+    RAW token — COMMENT is not coerced here.
+    """
+    stripped = line.strip().lstrip("#").replace("*", "").strip()
+    if ":" not in stripped:
+        return None
+    label, _, value = stripped.partition(":")
+    words = label.strip().lower().split()
+    if not words or words[-1] != "verdict":
+        return None
+    for token in value.strip().upper().split():
+        cleaned = token.strip("`.,;:!()[]{}\"'")
+        if cleaned in _VERDICT_TOKENS:
+            return cleaned
+    return None
+
+
 def parse_verdict(report_text: str) -> str:
     """Extract the verdict from a review report.
 
-    Hiro's verdict is binary: APPROVE or REQUEST_CHANGES. The legacy
-    third tier (COMMENT) is silently coerced to APPROVE when EXPLICITLY
-    EMITTED — older reviews on disk and back-compat with stale prompts
-    degrade gracefully to "approve with notes," matching the backend's
-    coercion in ``services/hiro_pr_reviewer._parse_verdict``.
+    ``report_text`` is the agent session's accumulated text — narration
+    first, the actual report (and its verdict line) usually near the
+    END, often markdown-decorated. The old first-10-lines scan misread
+    exactly those reports: an approving review whose verdict sat below
+    the window failed closed to a stored REQUEST_CHANGES with no
+    findings — the poisoned-row class behind securityengineer PRs
+    #1214/#1217/#1220. So: scan EVERY line.
 
-    Missing / unparseable verdict fails CLOSED to REQUEST_CHANGES.
-    Hiro is a safety control; the org's documented principle is that
-    safety systems must fail closed. The backend's auto-merge path
-    consumes the parsed verdict and only fails closed on null
-    risk/confidence — fail-open here would let a model that mangles
-    the Verdict header (e.g. via prompt-injection in PR content) reach
-    auto-merge as APPROVE.
+    A whole-text scan must not hand prompt-injected content the win,
+    so aggregation is fail-closed in the direction that matters:
+
+    * any REQUEST_CHANGES verdict line wins over any number of APPROVE
+      lines — injected trailing "Verdict: APPROVE" cannot override a
+      real blocker, and a spurious injected REQUEST_CHANGES merely
+      costs a fresh backend review, never a wrong approval;
+    * no verdict line at all fails closed to REQUEST_CHANGES.
+
+    Hiro's verdict is binary: APPROVE or REQUEST_CHANGES. The legacy
+    third tier (COMMENT) coerces to APPROVE when explicitly emitted —
+    back-compat with stale prompts degrades to "approve with notes,"
+    matching ``services/hiro_pr_reviewer._parse_verdict``.
     """
-    for line in report_text.splitlines()[:10]:
-        stripped = line.strip().replace("*", "")
-        if stripped.lower().startswith("verdict:"):
-            value = stripped.split(":", 1)[1].strip().upper()
-            if value == "COMMENT":
-                return "APPROVE"
-            if value in ("APPROVE", "REQUEST_CHANGES"):
-                return value
-    return "REQUEST_CHANGES"
+    values = [
+        v for v in (
+            _verdict_line_value(line) for line in report_text.splitlines()
+        )
+        if v is not None
+    ]
+    if not values:
+        return "REQUEST_CHANGES"
+    if "REQUEST_CHANGES" in values:
+        return "REQUEST_CHANGES"
+    return "APPROVE"
 
 
 def downgrade_verdict_to_request_changes(report_text: str) -> str:
     """Rewrite every verdict line in the report to REQUEST_CHANGES.
 
-    Uses the same line normalization as :func:`parse_verdict` (strip
-    ``*``, case-insensitive), so no formatting variant that the parser
-    would read as APPROVE — including the COMMENT coercion — can escape
-    the downgrade. Scans the whole text, not just the first 10 lines,
-    because callers may prepend annotations that shift the verdict down.
+    Shares :func:`_verdict_line_value` with :func:`parse_verdict`, so no
+    formatting variant the parser would read as APPROVE — including the
+    COMMENT coercion — can escape the downgrade.
     """
     lines = report_text.splitlines()
     for i, line in enumerate(lines):
-        stripped = line.strip().replace("*", "")
-        if stripped.lower().startswith("verdict:"):
-            value = stripped.split(":", 1)[1].strip().upper()
-            if value and value != "REQUEST_CHANGES":
-                lines[i] = "Verdict: REQUEST_CHANGES"
+        value = _verdict_line_value(line)
+        if value is not None and value != "REQUEST_CHANGES":
+            lines[i] = "Verdict: REQUEST_CHANGES"
     return "\n".join(lines)
 
 
