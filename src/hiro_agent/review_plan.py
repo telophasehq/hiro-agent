@@ -110,7 +110,7 @@ async def review_plan(
                     cwd=cwd,
                     allowed_tools=["Read", "Grep"],
                     mcp_setup=mcp_setup,
-                    max_turns=30,
+                    max_turns=60,
                     model="opus",
                     thinking_budget=30_000,
                     on_tool=_on_tool,
