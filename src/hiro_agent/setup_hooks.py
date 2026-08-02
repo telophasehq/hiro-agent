@@ -582,7 +582,7 @@ def _prompt_api_key(project_root: Path) -> Path | None:
             return _persist_api_key_in_shell(existing)
 
     api_key = click.prompt(
-        "Enter your Hiro API key (get one at https://app.hiro.is/settings/api-keys)",
+        "Enter your Hiro API key (get one at https://app.hirosecure.com/settings/api-keys)",
         hide_input=True,
         default="",
         show_default=False,
