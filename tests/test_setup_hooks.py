@@ -288,8 +288,8 @@ class TestSetupClaudeCode:
         assert "hiro-agents" in config["mcpServers"]
         assert "hiro-findings" not in config["mcpServers"]
         assert config["mcpServers"]["hiro"]["type"] == "http"
-        assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
-        assert config["mcpServers"]["hiro-agents"]["url"] == "https://api.hiro.is/mcp/agents/mcp"
+        assert config["mcpServers"]["hiro"]["url"] == "https://api.hirosecure.com/mcp/architect/mcp"
+        assert config["mcpServers"]["hiro-agents"]["url"] == "https://api.hirosecure.com/mcp/agents/mcp"
         assert config["mcpServers"]["hiro-agents"]["type"] == "http"
         assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
         assert config["mcpServers"]["hiro-agents"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
@@ -315,7 +315,7 @@ class TestSetupClaudeCode:
         (tmp_path / ".hiro" / "config.json").write_text(json.dumps({"api_key": "test-key"}))
         (tmp_path / ".mcp.json").write_text(json.dumps({
             "mcpServers": {
-                "hiro-findings": {"type": "http", "url": "https://api.hiro.is/mcp/notifications/mcp"},
+                "hiro-findings": {"type": "http", "url": "https://api.hirosecure.com/mcp/notifications/mcp"},
             }
         }))
 
@@ -384,8 +384,8 @@ class TestSetupClaudeDesktop:
         assert "hiro" in config["mcpServers"]
         assert "hiro-agents" in config["mcpServers"]
         assert "hiro-findings" not in config["mcpServers"]
-        assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
-        assert config["mcpServers"]["hiro-agents"]["url"] == "https://api.hiro.is/mcp/agents/mcp"
+        assert config["mcpServers"]["hiro"]["url"] == "https://api.hirosecure.com/mcp/architect/mcp"
+        assert config["mcpServers"]["hiro-agents"]["url"] == "https://api.hirosecure.com/mcp/agents/mcp"
         assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
         assert config["mcpServers"]["hiro-agents"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
 
@@ -412,7 +412,7 @@ class TestSetupClaudeDesktop:
         config_path.parent.mkdir(parents=True)
         config_path.write_text(json.dumps({
             "mcpServers": {
-                "hiro-findings": {"url": "https://api.hiro.is/mcp/notifications/mcp"},
+                "hiro-findings": {"url": "https://api.hirosecure.com/mcp/notifications/mcp"},
             }
         }))
         (tmp_path / ".hiro").mkdir()
@@ -468,7 +468,7 @@ class TestSetupClaudeDesktop:
             _setup_claude_desktop(tmp_path)
 
         config = json.loads(config_path.read_text())
-        assert config["mcpServers"]["hiro"]["url"] == "https://api.hiro.is/mcp/architect/mcp"
+        assert config["mcpServers"]["hiro"]["url"] == "https://api.hirosecure.com/mcp/architect/mcp"
         assert config["mcpServers"]["hiro"]["headers"]["Authorization"] == "Bearer ${HIRO_API_KEY}"
 
 

@@ -43,10 +43,10 @@ IGNORED_DIRS: frozenset[str] = frozenset({
 logger = structlog.get_logger(__name__)
 
 # Hardcoded — not configurable to prevent SSRF. HTTPS enforced.
-HIRO_MCP_URL = "https://api.hiro.is/mcp/architect/mcp"
-HIRO_INTERNAL_MCP_URL = "https://api.hiro.is/mcp/architect/internal/mcp"
-HIRO_AGENTS_MCP_URL = "https://api.hiro.is/mcp/agents/mcp"
-HIRO_BACKEND_URL = "https://api.hiro.is"
+HIRO_MCP_URL = "https://api.hirosecure.com/mcp/architect/mcp"
+HIRO_INTERNAL_MCP_URL = "https://api.hirosecure.com/mcp/architect/internal/mcp"
+HIRO_AGENTS_MCP_URL = "https://api.hirosecure.com/mcp/agents/mcp"
+HIRO_BACKEND_URL = "https://api.hirosecure.com"
 
 # Sent on every outbound request. http.client sends NO User-Agent by
 # default, and UA-less requests are dropped by common WAF bot rules

@@ -84,11 +84,11 @@ class TestGetMcpConfig:
 
     def test_hardcoded_mcp_url(self):
         """MCP URL should be hardcoded constant (not configurable)."""
-        assert HIRO_MCP_URL == "https://api.hiro.is/mcp/architect/mcp"
+        assert HIRO_MCP_URL == "https://api.hirosecure.com/mcp/architect/mcp"
 
     def test_hardcoded_backend_url(self):
         """Backend URL should be hardcoded constant."""
-        assert HIRO_BACKEND_URL == "https://api.hiro.is"
+        assert HIRO_BACKEND_URL == "https://api.hirosecure.com"
 
 
 class TestGetAgentEnv:
@@ -1486,7 +1486,7 @@ class TestUserAgent:
     """Every outbound HTTP surface must identify itself. http.client sends
     NO User-Agent by default, and UA-less requests get dropped by common
     WAF bot rules (NoUserAgent_HEADER blocked every CLI MCP call at the
-    api.hiro.is edge until the 2026-07-12 rule override)."""
+    api.hirosecure.com edge until the 2026-07-12 rule override)."""
 
     def test_user_agent_constant_shape(self):
         from hiro_agent import __version__
