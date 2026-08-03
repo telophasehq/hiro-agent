@@ -1557,3 +1557,19 @@ class TestUserAgent:
         monkeypatch.setattr("http.client.HTTPSConnection", FakeConn)
         assert _common._check_mcp_connection("hiro_ak_test") is None
         assert captured["headers"]["User-Agent"] == _common.USER_AGENT
+
+
+class TestExtractApiRefusal:
+    def test_extracts_detail_from_403_line(self):
+        from hiro_agent._common import _extract_api_refusal
+        lines = [
+            "some noise",
+            'API error 403: {"detail":"No active subscription, trial, or usage credits. Subscribe or buy pay-as-you-go credits at https://app.hirosecure.com/settings/billing"}',
+        ]
+        detail = _extract_api_refusal(lines)
+        assert detail is not None
+        assert "credits" in detail
+
+    def test_none_when_no_refusal_present(self):
+        from hiro_agent._common import _extract_api_refusal
+        assert _extract_api_refusal(["normal stderr", "more lines"]) is None
