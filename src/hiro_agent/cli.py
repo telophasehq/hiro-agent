@@ -143,6 +143,8 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
             )
         )
     except AgentResultError as exc:
+        if exc.api_error_detail:
+            click.echo(f"\nHiro API: {exc.api_error_detail}", err=True)
         click.echo(
             f"\nError: the review agent stopped without producing a verdict ({exc.subtype}). "
             "No APPROVE was issued — treat as REQUEST_CHANGES. Re-run, or review a smaller diff.",
@@ -191,6 +193,8 @@ def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
             )
         )
     except AgentResultError as exc:
+        if exc.api_error_detail:
+            click.echo(f"\nHiro API: {exc.api_error_detail}", err=True)
         click.echo(
             f"\nError: the review agent stopped without producing a verdict ({exc.subtype}). "
             "No APPROVE was issued — treat as REQUEST_CHANGES. Re-run, or review a smaller plan.",

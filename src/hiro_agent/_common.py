@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import collections
 import re
 import sys
 import threading
@@ -508,9 +509,13 @@ async def run_review_agent(
         model=_resolve_model(model),
         effort="high",
         env=_get_agent_env(),
-        stderr=lambda line: logger.debug("cli_stderr", agent="review", line=line.rstrip()),
+        stderr=lambda line: (
+            logger.debug("cli_stderr", agent="review", line=line.rstrip()),
+            _stderr_tail.append(line.rstrip()),
+        ),
     )
 
+    _stderr_tail: collections.deque[str] = collections.deque(maxlen=200)
     summary = ""
     stream = query(prompt=prompt, options=options)
     try:
@@ -531,6 +536,7 @@ async def run_review_agent(
                         subtype=str(message.subtype or "error"),
                         partial_output=summary,
                         session_id=message.session_id,
+                        api_error_detail=_extract_api_refusal(_stderr_tail),
                     )
                 break
     finally:
@@ -1231,6 +1237,22 @@ def _tool_summary(name: str, inp: dict) -> str:
 # Agent runner and display helpers
 # ---------------------------------------------------------------------------
 
+def _extract_api_refusal(lines) -> str | None:
+    """Pull a human-actionable refusal out of the CLI's stderr tail.
+
+    The Hiro API's entitlement gate returns 4xx with a JSON body whose
+    ``detail`` says exactly what to do (e.g. buy credits / check billing).
+    The Claude CLI prints that body to stderr before exiting; without this,
+    users only see "stopped without producing a verdict"."""
+    detail_re = re.compile(r'"detail"\s*:\s*"([^"]+)"')
+    for line in reversed(list(lines)):
+        if "403" in line or "402" in line or "detail" in line:
+            m = detail_re.search(line)
+            if m:
+                return m.group(1)
+    return None
+
+
 class AgentResultError(RuntimeError):
     """The agent run ended with an error result (e.g. ran out of turns).
 
@@ -1239,11 +1261,22 @@ class AgentResultError(RuntimeError):
     before the run ended — it is NOT a completed report.
     """
 
-    def __init__(self, agent: str, subtype: str, partial_output: str, session_id: str):
+    def __init__(
+        self,
+        agent: str,
+        subtype: str,
+        partial_output: str,
+        session_id: str,
+        api_error_detail: str | None = None,
+    ):
         self.agent = agent
         self.subtype = subtype
         self.partial_output = partial_output
         self.session_id = session_id
+        # Human-actionable refusal from the Hiro API (e.g. the billing gate's
+        # 403 detail), extracted from the CLI's stderr so users see "buy
+        # credits", not just "no verdict".
+        self.api_error_detail = api_error_detail
         super().__init__(f"agent '{agent}' ended with error result: {subtype}")
 
 
