@@ -29,4 +29,6 @@ jobs:
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4.2.0
       - run: uv venv && uv pip install build
       - run: .venv/bin/python -m build
-      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
+      # v1.14.2 — older pins bundle a twine that rejects Metadata-Version 2.5,
+      # which current hatchling emits (v0.1.17 publish failed on exactly this).
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
