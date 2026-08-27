@@ -722,6 +722,38 @@ class TestRunTrackedAgent:
         assert exc_info.value.session_id == "sess-1"
 
     @pytest.mark.asyncio
+    async def test_error_result_carries_result_text(self):
+        """The ResultMessage's own error string survives into the typed error.
+
+        An error result can arrive with subtype "success" (e.g. an API 400
+        on the first model call) — the cause lives only in ``result``.
+        """
+        from claude_agent_sdk import ResultMessage
+
+        async def mock_query(prompt, options):
+            yield ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1,
+                is_error=True, num_turns=1, session_id="sess-1",
+                result='API Error: 400 "thinking.type.enabled" is not supported',
+            )
+
+        setup = McpSetup(mcp_config={}, mcp_tools=[], org_context=None, security_policy=None)
+
+        with patch("hiro_agent._common.query", side_effect=mock_query):
+            with pytest.raises(AgentResultError) as exc_info:
+                await _run_tracked_agent(
+                    name="review",
+                    prompt="review the diff",
+                    system_prompt="system",
+                    cwd="/tmp",
+                    allowed_tools=["Read"],
+                    mcp_setup=setup,
+                )
+
+        assert exc_info.value.subtype == "success"
+        assert "API Error: 400" in exc_info.value.result_text
+
+    @pytest.mark.asyncio
     async def test_max_turns_resumes_session_to_conclude(self):
         """error_max_turns triggers one resumed run that forces a report."""
         from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock

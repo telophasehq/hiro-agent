@@ -145,6 +145,8 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     except AgentResultError as exc:
         if exc.api_error_detail:
             click.echo(f"\nHiro API: {exc.api_error_detail}", err=True)
+        if exc.result_text:
+            click.echo(f"\nAgent error: {exc.result_text[:500]}", err=True)
         click.echo(
             f"\nError: the review agent stopped without producing a verdict ({exc.subtype}). "
             "No APPROVE was issued — treat as REQUEST_CHANGES. Re-run, or review a smaller diff.",
@@ -195,6 +197,8 @@ def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     except AgentResultError as exc:
         if exc.api_error_detail:
             click.echo(f"\nHiro API: {exc.api_error_detail}", err=True)
+        if exc.result_text:
+            click.echo(f"\nAgent error: {exc.result_text[:500]}", err=True)
         click.echo(
             f"\nError: the review agent stopped without producing a verdict ({exc.subtype}). "
             "No APPROVE was issued — treat as REQUEST_CHANGES. Re-run, or review a smaller plan.",
@@ -232,6 +236,10 @@ def review_infra_cmd(filepath: str | None, output_file: str | None) -> None:
                 review_infrastructure(config, filename="stdin")
             )
     except AgentResultError as exc:
+        if exc.api_error_detail:
+            click.echo(f"Hiro API: {exc.api_error_detail}", err=True)
+        if exc.result_text:
+            click.echo(f"Agent error: {exc.result_text[:500]}", err=True)
         click.echo(
             f"Error: the review agent stopped without producing a report ({exc.subtype}).",
             err=True,

@@ -537,6 +537,7 @@ async def run_review_agent(
                         partial_output=summary,
                         session_id=message.session_id,
                         api_error_detail=_extract_api_refusal(_stderr_tail),
+                        result_text=str(message.result or "") or None,
                     )
                 break
     finally:
@@ -1268,6 +1269,7 @@ class AgentResultError(RuntimeError):
         partial_output: str,
         session_id: str,
         api_error_detail: str | None = None,
+        result_text: str | None = None,
     ):
         self.agent = agent
         self.subtype = subtype
@@ -1277,6 +1279,11 @@ class AgentResultError(RuntimeError):
         # 403 detail), extracted from the CLI's stderr so users see "buy
         # credits", not just "no verdict".
         self.api_error_detail = api_error_detail
+        # The ResultMessage's own ``result`` string. On error results the CLI
+        # puts the underlying failure there (e.g. 'API Error: 400 …'), and an
+        # error result can carry subtype "success" — without this the user
+        # sees only "no verdict (success)" with the actual cause discarded.
+        self.result_text = result_text
         super().__init__(f"agent '{agent}' ended with error result: {subtype}")
 
 
@@ -1350,10 +1357,12 @@ async def _run_tracked_agent(
     # Stderr lines arrive on a background task even while __anext__() is
     # blocked during extended thinking, preventing false stall timeouts.
     _heartbeat = [_time.monotonic()]
+    _stderr_tail: collections.deque[str] = collections.deque(maxlen=200)
 
     def _stderr_heartbeat(line: str) -> None:
         _heartbeat[0] = _time.monotonic()
         logger.debug("cli_stderr", agent=name, line=line.rstrip())
+        _stderr_tail.append(line.rstrip())
 
     # Opus 4.7 on Bedrock rejects ``thinking.type = enabled`` — it requires
     # ``adaptive`` with a companion ``output_config.effort``. Pre-4.7 models
@@ -1417,6 +1426,7 @@ async def _run_tracked_agent(
     all_text_blocks: list[str] = []  # Accumulate all primary agent text
     session_id = ""
     result_error_subtype: str | None = None
+    result_error_text: str | None = None
     active_task_ids: set[str] = set()  # Track Task sub-agent tool_use_ids
     tool_start_times: dict[str, float] = {}
     tool_meta: dict[str, tuple[str, bool, str]] = {}
@@ -1665,6 +1675,7 @@ async def _run_tracked_agent(
                 )
                 if message.is_error:
                     result_error_subtype = str(message.subtype or "error")
+                    result_error_text = str(message.result or "") or None
                 if on_result is not None:
                     try:
                         on_result(message)
@@ -1762,6 +1773,8 @@ async def _run_tracked_agent(
                     subtype="error_max_turns",
                     partial_output=full_output,
                     session_id=concluded_session or session_id,
+                    api_error_detail=_extract_api_refusal(_stderr_tail),
+                    result_text=result_error_text,
                 )
             concluded = downgrade_verdict_to_request_changes(concluded)
             concluded = f"{_TRUNCATED_REVIEW_NOTE}\n\n{concluded}"
@@ -1771,6 +1784,8 @@ async def _run_tracked_agent(
             subtype=result_error_subtype,
             partial_output=full_output,
             session_id=session_id,
+            api_error_detail=_extract_api_refusal(_stderr_tail),
+            result_text=result_error_text,
         )
 
     # Return all accumulated text from the primary agent, joined.

@@ -1,12 +1,21 @@
 [project]
 name = "hiro-agent"
-version = "0.1.16"
+version = "0.1.17"
 description = "AI security review agent for code, plans, and infrastructure"
 requires-python = ">=3.11"
 license = "MIT"
 readme = "README.md"
 dependencies = [
-    "claude-agent-sdk>=0.1.37",
+    # 0.2.x bundles a pinned Claude CLI. 0.1.x resolves the SYSTEM claude
+    # binary, so a routine claude auto-update breaks every review with
+    # "stopped without producing a verdict (success)" — 0.1.65 + claude
+    # 2.1.2xx sends the legacy thinking shape and 400s on the first model
+    # call (PayClear outage 2026-08-21..27). 0.2.124 is the earliest
+    # version verified in the field. A floor bump (not just a new release)
+    # is required so plain `pipx upgrade` actually replaces the frozen SDK,
+    # and the <0.3 cap keeps the next major jump a deliberate, tested release
+    # instead of a surprise on fresh installs.
+    "claude-agent-sdk>=0.2.124,<0.3",
     "structlog",
     "click>=8.0",
     "pyjwt[crypto]>=2.12.0",
