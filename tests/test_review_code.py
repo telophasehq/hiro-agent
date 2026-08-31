@@ -266,3 +266,29 @@ class TestReviewCode:
         state = json.loads(state_file.read_text())
         assert state["needs_review"] is False
         assert state["modified_files"] == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_key_does_not_leak_diff_temp_file(tmp_path, monkeypatch):
+    """HiroAuthError from prepare_mcp must not strand the diff temp file —
+    the preflight runs BEFORE mkstemp so a stale-key retry loop can't
+    accumulate copies of the (possibly secret-bearing) diff in the temp
+    dir. Regression for the leak found in adversarial review of v0.1.18."""
+    from unittest.mock import patch as _patch
+
+    from hiro_agent._common import HiroAuthError
+    from hiro_agent.review_code import review_code
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    import tempfile as _tempfile
+    monkeypatch.setattr(_tempfile, "tempdir", None)  # re-read TMPDIR
+
+    async def _reject(**kwargs):
+        raise HiroAuthError("HTTP 401 Unauthorized")
+
+    with _patch("hiro_agent.review_code.prepare_mcp", side_effect=_reject):
+        with pytest.raises(HiroAuthError):
+            await review_code("diff --git a/x b/x\n+secret", cwd=".",
+                              verbose=False, mirror_to_stdout=False)
+
+    assert list(tmp_path.glob("hiro-diff-*")) == []

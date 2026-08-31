@@ -190,6 +190,39 @@ def _check_mcp_connection(api_key: str) -> str | None:
         return f"{e}"
 
 
+def _is_auth_rejection(err: str | None) -> bool:
+    """True when a preflight error string means the API key was REJECTED.
+
+    Relies on ``_check_mcp_connection``'s ``f"HTTP {status} {reason}"``
+    format (pinned by test). 401 is deterministic: the backend's MCP auth
+    middleware emits ONLY 401 for missing/invalid keys, and the same key
+    is about to be injected as the agent's ANTHROPIC_API_KEY — so the LLM
+    run is guaranteed to die minutes later with the cause buried inside
+    the CLI's retry loop (the 2026-08-31 stale-env-key incident: ~178s of
+    silent 401 retries per review, reported only as "no verdict").
+
+    403 is deliberately NOT a rejection: on this endpoint it means an edge
+    block (the 2026-07 WAF NoUserAgent incident 403'd this exact path
+    fleet-wide with valid keys, while the Claude CLI's own llm-proxy calls
+    still worked) — hard-failing would accuse a working key. Everything
+    but 401 — 403, timeout, DNS, 5xx — stays warn-and-degrade.
+    """
+    return bool(err) and err.startswith("HTTP 401")
+
+
+class HiroAuthError(RuntimeError):
+    """The configured Hiro API key was rejected (HTTP 401/403) at preflight.
+
+    Raised instead of degrading: proceeding would route the whole agent run
+    through the LLM proxy with the same rejected key. ``detail`` carries the
+    preflight status line (e.g. "HTTP 401 Unauthorized").
+    """
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(f"Hiro API key rejected ({detail})")
+
+
 def _mcp_call_tool(api_key: str, tool_name: str, arguments: dict | None = None, *, timeout: int = 5, url: str | None = None) -> str | None:
     """Call an MCP tool via direct JSON-RPC POST and return the text result.
 
@@ -304,6 +337,10 @@ async def prepare_mcp(*, is_tty: bool = True) -> McpSetup:
     api_key = _get_api_key()
     err = await asyncio.to_thread(_check_mcp_connection, api_key)
     if err:
+        # A rejected key is fatal, not degradable — the run would fail
+        # anyway, slowly and opaquely (see _is_auth_rejection).
+        if _is_auth_rejection(err):
+            raise HiroAuthError(err)
         if is_tty:
             print(
                 f"  {_YELLOW}warning:{_RESET} Hiro MCP unavailable ({err})"
@@ -489,6 +526,8 @@ async def run_review_agent(
             api_key = _get_api_key()
             err = await asyncio.to_thread(_check_mcp_connection, api_key)
             if err:
+                if _is_auth_rejection(err):
+                    raise HiroAuthError(err)
                 logger.warning("mcp_preflight_failed", error=err)
                 mcp_config = {}
             else:
@@ -538,6 +577,7 @@ async def run_review_agent(
                         session_id=message.session_id,
                         api_error_detail=_extract_api_refusal(_stderr_tail),
                         result_text=str(message.result or "") or None,
+                        stderr_hint=_last_meaningful_stderr(_stderr_tail),
                     )
                 break
     finally:
@@ -808,6 +848,8 @@ async def run_streaming_agent(
             api_key = _get_api_key()
             err = await asyncio.to_thread(_check_mcp_connection, api_key)
             if err:
+                if _is_auth_rejection(err):
+                    raise HiroAuthError(err)
                 if is_tty:
                     print(
                         f"  {_YELLOW}warning:{_RESET} Hiro MCP unavailable ({err})"
@@ -1247,10 +1289,27 @@ def _extract_api_refusal(lines) -> str | None:
     users only see "stopped without producing a verdict"."""
     detail_re = re.compile(r'"detail"\s*:\s*"([^"]+)"')
     for line in reversed(list(lines)):
-        if "403" in line or "402" in line or "detail" in line:
+        if "403" in line or "402" in line or "401" in line or "detail" in line:
             m = detail_re.search(line)
             if m:
                 return m.group(1)
+    return None
+
+
+# The Claude CLI's "connectors are disabled because ANTHROPIC_API_KEY..."
+# notice appears on every proxied run — it is ambient noise, never a cause.
+_STDERR_NOISE_MARKERS = ("connectors are disabled",)
+
+
+def _last_meaningful_stderr(lines) -> str | None:
+    """Last non-noise stderr line — the fallback cause when an error
+    ResultMessage carries no ``result`` text (the 2026-08-31 failures:
+    is_error=True, subtype="success", empty result — the user and the log
+    got zero signal about the underlying 401)."""
+    for line in reversed(list(lines)):
+        s = line.strip()
+        if s and not any(marker in s for marker in _STDERR_NOISE_MARKERS):
+            return s[:300]
     return None
 
 
@@ -1270,11 +1329,15 @@ class AgentResultError(RuntimeError):
         session_id: str,
         api_error_detail: str | None = None,
         result_text: str | None = None,
+        stderr_hint: str | None = None,
     ):
         self.agent = agent
         self.subtype = subtype
         self.partial_output = partial_output
         self.session_id = session_id
+        # Last non-noise CLI stderr line — the only remaining cause signal
+        # when both result_text and api_error_detail are empty.
+        self.stderr_hint = stderr_hint
         # Human-actionable refusal from the Hiro API (e.g. the billing gate's
         # 403 detail), extracted from the CLI's stderr so users see "buy
         # credits", not just "no verdict".
@@ -1672,6 +1735,14 @@ async def _run_tracked_agent(
                     is_error=message.is_error,
                     duration_ms=message.duration_ms,
                     elapsed_s=round(now - run_started_at, 1),
+                    # On error results, the cause lives ONLY here — without
+                    # this field the log carries zero failure signal (the
+                    # 2026-08-31 diagnosis had to come from server-side
+                    # access logs).
+                    result_error=(
+                        str(message.result or "")[:300]
+                        if message.is_error else ""
+                    ),
                 )
                 if message.is_error:
                     result_error_subtype = str(message.subtype or "error")
@@ -1775,6 +1846,7 @@ async def _run_tracked_agent(
                     session_id=concluded_session or session_id,
                     api_error_detail=_extract_api_refusal(_stderr_tail),
                     result_text=result_error_text,
+                    stderr_hint=_last_meaningful_stderr(_stderr_tail),
                 )
             concluded = downgrade_verdict_to_request_changes(concluded)
             concluded = f"{_TRUNCATED_REVIEW_NOTE}\n\n{concluded}"
@@ -1786,6 +1858,7 @@ async def _run_tracked_agent(
             session_id=session_id,
             api_error_detail=_extract_api_refusal(_stderr_tail),
             result_text=result_error_text,
+            stderr_hint=_last_meaningful_stderr(_stderr_tail),
         )
 
     # Return all accumulated text from the primary agent, joined.

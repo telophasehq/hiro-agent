@@ -82,6 +82,28 @@ def _default_review_output_path(command_name: str) -> str:
     return str(Path(tempfile.gettempdir()) / filename)
 
 
+def _print_auth_error(exc, command: str, log_path: str | None = None) -> None:
+    """Actionable message for a rejected Hiro API key (fail-fast path).
+
+    The single most common cause in the field is a stale exported
+    HIRO_API_KEY shadowing a valid ``.hiro/config.json`` key — say so
+    explicitly instead of letting the run die minutes later with the
+    cause buried in the CLI's retry loop.
+    """
+    click.echo(
+        f"Error: Hiro rejected your API key ({exc.detail}).\n"
+        "The key comes from the HIRO_API_KEY env var when set, otherwise "
+        ".hiro/config.json.\n"
+        "A stale exported HIRO_API_KEY commonly shadows a valid config key "
+        "— try:\n"
+        f"  env -u HIRO_API_KEY hiro {command}\n"
+        "or run `hiro setup` to refresh the stored key.",
+        err=True,
+    )
+    if log_path:
+        click.echo(f"Log: {log_path}", err=True)
+
+
 def _read_stdin(command_name: str) -> str:
     """Read stdin with a 2MB size cap."""
     if sys.stdin.isatty():
@@ -116,7 +138,7 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     Usage with AI coding tools (Claude Code, Cursor, etc.):
       git diff | hiro review-code
     """
-    from hiro_agent._common import AgentResultError
+    from hiro_agent._common import AgentResultError, HiroAuthError
     from hiro_agent.review_code import review_code
 
     log_path = _configure_file_logging()
@@ -142,11 +164,16 @@ def review_code_cmd(context: str, quiet: bool, output_file: str | None) -> None:
                 mirror_to_stdout=mirror,
             )
         )
+    except HiroAuthError as exc:
+        _print_auth_error(exc, "review-code", log_path)
+        raise SystemExit(1) from None
     except AgentResultError as exc:
         if exc.api_error_detail:
             click.echo(f"\nHiro API: {exc.api_error_detail}", err=True)
         if exc.result_text:
             click.echo(f"\nAgent error: {exc.result_text[:500]}", err=True)
+        elif exc.stderr_hint:
+            click.echo(f"\nAgent stderr: {exc.stderr_hint}", err=True)
         click.echo(
             f"\nError: the review agent stopped without producing a verdict ({exc.subtype}). "
             "No APPROVE was issued — treat as REQUEST_CHANGES. Re-run, or review a smaller diff.",
@@ -168,7 +195,7 @@ def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
     Usage with AI coding tools (Claude Code, Cursor, etc.):
       cat plan.md | hiro review-plan
     """
-    from hiro_agent._common import AgentResultError
+    from hiro_agent._common import AgentResultError, HiroAuthError
     from hiro_agent.review_plan import review_plan
 
     log_path = _configure_file_logging()
@@ -194,11 +221,16 @@ def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
                 mirror_to_stdout=mirror,
             )
         )
+    except HiroAuthError as exc:
+        _print_auth_error(exc, "review-plan", log_path)
+        raise SystemExit(1) from None
     except AgentResultError as exc:
         if exc.api_error_detail:
             click.echo(f"\nHiro API: {exc.api_error_detail}", err=True)
         if exc.result_text:
             click.echo(f"\nAgent error: {exc.result_text[:500]}", err=True)
+        elif exc.stderr_hint:
+            click.echo(f"\nAgent stderr: {exc.stderr_hint}", err=True)
         click.echo(
             f"\nError: the review agent stopped without producing a verdict ({exc.subtype}). "
             "No APPROVE was issued — treat as REQUEST_CHANGES. Re-run, or review a smaller plan.",
@@ -214,10 +246,10 @@ def review_plan_cmd(context: str, quiet: bool, output_file: str | None) -> None:
 @click.option("--output", "-o", "output_file", default=None, type=click.Path(), help="Write report to file instead of stdout.")
 def review_infra_cmd(filepath: str | None, output_file: str | None) -> None:
     """Review infrastructure config for security issues. File arg or stdin."""
-    from hiro_agent._common import AgentResultError
+    from hiro_agent._common import AgentResultError, HiroAuthError
     from hiro_agent.review_infra import review_infrastructure
 
-    _configure_file_logging()
+    log_path = _configure_file_logging()
     click.echo("Reviewing infrastructure...\n", err=True)
     try:
         if filepath:
@@ -235,15 +267,21 @@ def review_infra_cmd(filepath: str | None, output_file: str | None) -> None:
             result = asyncio.run(
                 review_infrastructure(config, filename="stdin")
             )
+    except HiroAuthError as exc:
+        _print_auth_error(exc, "review-infra", log_path)
+        raise SystemExit(1) from None
     except AgentResultError as exc:
         if exc.api_error_detail:
             click.echo(f"Hiro API: {exc.api_error_detail}", err=True)
         if exc.result_text:
             click.echo(f"Agent error: {exc.result_text[:500]}", err=True)
+        elif exc.stderr_hint:
+            click.echo(f"Agent stderr: {exc.stderr_hint}", err=True)
         click.echo(
             f"Error: the review agent stopped without producing a report ({exc.subtype}).",
             err=True,
         )
+        click.echo(f"Log: {log_path}", err=True)
         raise SystemExit(2) from None
 
     if output_file:
@@ -259,6 +297,7 @@ def review_infra_cmd(filepath: str | None, output_file: str | None) -> None:
 @click.argument("question", nargs=-1, required=True)
 def chat(question: tuple[str, ...], quiet: bool, output_file: str | None) -> None:
     """Ask a security question about your codebase."""
+    from hiro_agent._common import HiroAuthError
     from hiro_agent.chat import chat as run_chat
 
     log_path = _configure_file_logging()
@@ -266,7 +305,11 @@ def chat(question: tuple[str, ...], quiet: bool, output_file: str | None) -> Non
     cwd = os.getcwd()
     full_question = " ".join(question)
     click.echo("Thinking...\n", err=True)
-    asyncio.run(run_chat(full_question, cwd=cwd, verbose=not quiet, output_file=output_file))
+    try:
+        asyncio.run(run_chat(full_question, cwd=cwd, verbose=not quiet, output_file=output_file))
+    except HiroAuthError as exc:
+        _print_auth_error(exc, "chat", log_path)
+        raise SystemExit(1) from None
     if output_file:
         click.echo(f"Report written to {output_file}", err=True)
     click.echo(f"\nLog: {log_path}", err=True)

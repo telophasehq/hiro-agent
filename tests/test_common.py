@@ -1605,3 +1605,120 @@ class TestExtractApiRefusal:
     def test_none_when_no_refusal_present(self):
         from hiro_agent._common import _extract_api_refusal
         assert _extract_api_refusal(["normal stderr", "more lines"]) is None
+
+
+class TestAuthRejectionFailFast:
+    """A REJECTED key (401/403) fails fast at preflight instead of degrading
+    — proceeding would route the whole run through the LLM proxy with the
+    same dead key and die ~3 minutes later with the cause buried (the
+    2026-08-31 stale-env-key incident)."""
+
+    def test_is_auth_rejection_matrix(self):
+        from hiro_agent._common import _is_auth_rejection
+
+        assert _is_auth_rejection("HTTP 401 Unauthorized")
+        # 403 is NOT a rejection: the MCP auth middleware only emits 401
+        # for key problems; a 403 here is an edge/WAF block (2026-07
+        # NoUserAgent incident 403'd this path fleet-wide with VALID keys
+        # while llm-proxy traffic still worked) — degrade, don't accuse.
+        assert not _is_auth_rejection("HTTP 403 Forbidden")
+        assert not _is_auth_rejection("HTTP 503 Service Unavailable")
+        assert not _is_auth_rejection("HTTP 500 Internal Server Error")
+        assert not _is_auth_rejection("connection refused")
+        assert not _is_auth_rejection("timed out")
+        assert not _is_auth_rejection(None)
+        assert not _is_auth_rejection("")
+
+    def test_check_mcp_connection_401_format_is_pinned(self):
+        """_is_auth_rejection parses _check_mcp_connection's error string —
+        pin the `HTTP {status} {reason}` format so they can't drift."""
+        from hiro_agent._common import _check_mcp_connection, _is_auth_rejection
+
+        class FakeResponse:
+            status = 401
+            reason = "Unauthorized"
+
+        fake_conn = type("FakeConn", (), {
+            "request": lambda self, *a, **k: None,
+            "getresponse": lambda self: FakeResponse(),
+            "close": lambda self: None,
+        })()
+        with patch("http.client.HTTPSConnection", return_value=fake_conn):
+            err = _check_mcp_connection("hiro_ak_test")
+
+        assert err == "HTTP 401 Unauthorized"
+        assert _is_auth_rejection(err)
+
+    @pytest.mark.asyncio
+    async def test_prepare_mcp_raises_on_rejected_key(self):
+        from hiro_agent._common import HiroAuthError, prepare_mcp
+
+        with (
+            patch("hiro_agent._common._check_mcp_connection",
+                  return_value="HTTP 401 Unauthorized"),
+            patch.dict(os.environ, {"HIRO_API_KEY": "hiro_ak_stale"}),
+        ):
+            with pytest.raises(HiroAuthError) as exc_info:
+                await prepare_mcp(is_tty=False)
+
+        assert exc_info.value.detail == "HTTP 401 Unauthorized"
+
+    @pytest.mark.asyncio
+    async def test_prepare_mcp_still_degrades_on_transient_failure(self):
+        """Timeouts/5xx keep the warn-and-degrade behavior — only definitive
+        auth rejection is fatal."""
+        from hiro_agent._common import prepare_mcp
+
+        with (
+            patch("hiro_agent._common._check_mcp_connection",
+                  return_value="HTTP 503 Service Unavailable"),
+            patch.dict(os.environ, {"HIRO_API_KEY": "hiro_ak_test"}),
+        ):
+            setup = await prepare_mcp(is_tty=False)
+
+        assert setup.mcp_config == {}
+
+    @pytest.mark.asyncio
+    async def test_prepare_mcp_degrades_on_403_waf_block(self):
+        """403 = edge/WAF block, not key rejection — must degrade."""
+        from hiro_agent._common import prepare_mcp
+
+        with (
+            patch("hiro_agent._common._check_mcp_connection",
+                  return_value="HTTP 403 Forbidden"),
+            patch.dict(os.environ, {"HIRO_API_KEY": "hiro_ak_test"}),
+        ):
+            setup = await prepare_mcp(is_tty=False)
+
+        assert setup.mcp_config == {}
+
+
+class TestStderrHint:
+    def test_last_meaningful_stderr_skips_noise_and_blanks(self):
+        from hiro_agent._common import _last_meaningful_stderr
+
+        lines = [
+            "⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY is set",
+            "",
+            'API Error: 401 {"detail":"Invalid API key"}',
+            "   ",
+        ]
+        assert _last_meaningful_stderr(lines) == (
+            'API Error: 401 {"detail":"Invalid API key"}'
+        )
+
+    def test_last_meaningful_stderr_none_when_only_noise(self):
+        from hiro_agent._common import _last_meaningful_stderr
+
+        assert _last_meaningful_stderr([
+            "⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY is set",
+            "",
+        ]) is None
+        assert _last_meaningful_stderr([]) is None
+
+    def test_extract_api_refusal_matches_401_detail(self):
+        from hiro_agent._common import _extract_api_refusal
+
+        assert _extract_api_refusal([
+            'API Error: 401 {"detail":"Invalid API key"}',
+        ]) == "Invalid API key"

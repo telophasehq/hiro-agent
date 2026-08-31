@@ -1,6 +1,6 @@
 [project]
 name = "hiro-agent"
-version = "0.1.17"
+version = "0.1.18"
 description = "AI security review agent for code, plans, and infrastructure"
 requires-python = ">=3.11"
 license = "MIT"
