@@ -51,6 +51,12 @@ async def review_plan(
 
     logger.info("review_plan_started", cwd=cwd, plan_len=len(plan))
 
+    # Shared MCP setup — called once. Runs BEFORE the plan temp file is
+    # created: prepare_mcp can raise HiroAuthError (rejected key), and a
+    # raise between mkstemp and the cleanup try/finally below would leak
+    # the plan into the temp dir on every retry.
+    mcp_setup = await prepare_mcp(is_tty=is_tty)
+
     # Write plan to a temp file so the agent can Read it instead of
     # embedding the entire plan in the prompt context window.
     plan_fd, plan_path = tempfile.mkstemp(suffix=".md", prefix="hiro-plan-")
@@ -59,9 +65,6 @@ async def review_plan(
     finally:
         os.close(plan_fd)
     logger.info("plan_written", path=plan_path, size=len(plan))
-
-    # Shared MCP setup — called once
-    mcp_setup = await prepare_mcp(is_tty=is_tty)
 
     display = _ScanDisplay(["review"], skip_phases=True) if is_tty else None
 

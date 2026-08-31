@@ -90,6 +90,17 @@ async def review_code(
 
     logger.info("review_code_started", cwd=cwd, diff_len=len(diff))
 
+    # Shared MCP setup — called once. Runs BEFORE the diff temp file is
+    # created: prepare_mcp can raise HiroAuthError (rejected key), and a
+    # raise between mkstemp and the cleanup try/finally below would leak
+    # the full diff into the temp dir on every retry.
+    mcp_setup = await prepare_mcp(is_tty=is_tty)
+
+    # Prefetch infrastructure context for this diff
+    api_key = _get_api_key()
+    if api_key and mcp_setup.mcp_config:
+        mcp_setup.review_context = await _prefetch_review_context(api_key, diff)
+
     # Write diff to a temp file so the agent can Read it instead of
     # embedding the entire diff in the prompt context window.
     diff_fd, diff_path = tempfile.mkstemp(suffix=".patch", prefix="hiro-diff-")
@@ -98,14 +109,6 @@ async def review_code(
     finally:
         os.close(diff_fd)
     logger.info("diff_written", path=diff_path, size=len(diff))
-
-    # Shared MCP setup — called once
-    mcp_setup = await prepare_mcp(is_tty=is_tty)
-
-    # Prefetch infrastructure context for this diff
-    api_key = _get_api_key()
-    if api_key and mcp_setup.mcp_config:
-        mcp_setup.review_context = await _prefetch_review_context(api_key, diff)
 
     display = _ScanDisplay(["review"], skip_phases=True) if is_tty else None
 
